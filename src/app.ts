@@ -12,6 +12,11 @@ import { accountRouter } from './modules/account/account.routes';
 import { invoiceRouter } from './modules/invoices/invoices.routes';
 import { reportsRouter } from './modules/reports/reports.routes';
 import { adminRouter } from './modules/admin/admin.routes';
+import { staffRouter } from './modules/staff/staff.routes';
+import { inventoryRouter } from './modules/inventory/inventory.routes';
+import { pricingRouter } from './modules/pricing/pricing.routes';
+import { distributorCommissionRouter } from './modules/commission/commission.routes';
+import { supportRouter } from './modules/support/support.routes';
 import { chatRouter } from './modules/chat/chat.routes';
 import { deviceRouter } from './modules/devices/devices.routes';
 import { docsRouter } from './modules/docs/docs.routes';
@@ -100,6 +105,11 @@ export function createApp() {
   app.use('/api/v1/chat', chatRouter);
   app.use('/api/v1/devices', deviceRouter);
   app.use('/api/v1/admin', adminRouter);
+  app.use('/api/v1/staff', staffRouter);
+  app.use('/api/v1/inventory', inventoryRouter);
+  app.use('/api/v1/pricing', pricingRouter);
+  app.use('/api/v1/commission', distributorCommissionRouter);
+  app.use('/api/v1/support', supportRouter);
   if (!env.isProd || process.env.ENABLE_DOCS === '1') app.use(docsRouter); // API docs are not published by default in production
 
   app.use((_req, res) => res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Route not found' } }));

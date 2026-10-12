@@ -4,6 +4,8 @@ import { createApp } from './app';
 import { env } from './config/env';
 import { pool } from './db/pool';
 import { startJobs } from './jobs/subscriptionWarnings';
+import { startReportWorker } from './modules/reports/jobs';
+import { startSupportWorker } from './modules/support/support.service';
 import { attachSocket } from './modules/chat/chat.routes';
 import { logger } from './utils/logger';
 
@@ -16,6 +18,8 @@ async function start() {
   http.listen(env.port, () => {
     logger.info({ port: env.port }, 'AAYME API listening');
     startJobs();
+    startReportWorker();
+    startSupportWorker();
     pool.query<any[]>("SELECT COUNT(*) n FROM information_schema.triggers WHERE trigger_schema = DATABASE() AND trigger_name LIKE 'trg\\_%\\_no\\_%'")
       .then(([rows]) => { if (Number(rows[0].n) < 8) logger.warn('Database does not enforce append-only ledger history (triggers missing). See DEPLOYMENT.md.'); })
       .catch(() => {});

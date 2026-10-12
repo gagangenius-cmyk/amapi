@@ -11,6 +11,9 @@ import { assertSubscriptionActive } from '../distributors/subscription';
 import { changeStock, loadTiers } from './stock';
 import { todayUtc } from './batches';
 import { EXT, sniffImage, storage } from '../../services/storage';
+import { idsToNames, listVersions, syncProduct } from './governance';
+import { reservedByProduct } from '../inventory/inventory.service';
+import { effectiveTable, loadRules } from '../pricing/resolver';
 
 export const catalogRouter = Router();
 catalogRouter.use(authenticate);
@@ -39,6 +42,8 @@ export function presentProduct(p: any, tiers: { min_qty: number; price_paise: nu
     discount_pct: mrp && mrp > price ? Math.round(((mrp - price) / mrp) * 100) : 0,
     stock_qty: p.stock_qty, stock_status: stockStatus(p), min_order_qty: p.min_order_qty, low_stock_threshold: p.low_stock_threshold,
     is_active: !!p.is_active,
+    category_id: p.category_id ?? null, brand_id: p.brand_id ?? null,
+    review_status: p.review_status ?? 'approved', review_note: p.review_note ?? null,
     tiers: tiers.map((t) => ({ min_qty: t.min_qty, price: fromPaise(t.price_paise) })),
     images: images.map((i) => ({ id: i.id, url: imageUrl(i.file_key) })), image_url: images[0] ? imageUrl(images[0].file_key) : null,
   };
@@ -47,19 +52,50 @@ export function presentProduct(p: any, tiers: { min_qty: number; price_paise: nu
 export async function presentProducts(c: Conn, rows: any[]) {
   const ids = rows.map((r) => r.id);
   const tiers = await loadTiers(c, ids);
+  const reserved = await reservedByProduct(c, ids);
   const imgs = ids.length ? await q<any>(c, 'SELECT id, product_id, file_key FROM product_images WHERE product_id IN (?) ORDER BY position, id', [ids]) : [];
-  return rows.map((r) => presentProduct(r, tiers.get(r.id) ?? [], imgs.filter((i) => i.product_id === r.id)));
+  return rows.map((r) => ({
+    ...presentProduct(r, tiers.get(r.id) ?? [], imgs.filter((i) => i.product_id === r.id)),
+    reserved_qty: reserved.get(r.id) ?? 0, available_qty: Math.max(0, r.stock_qty - (reserved.get(r.id) ?? 0)),
+  }));
 }
 
 /** What a retailer may see of a distributor's catalog: active, not deleted; searchable. */
-export async function storefrontProducts(distributorId: number, opts: { q?: string; category?: string; limit?: number; offset?: number } = {}) {
-  const where = ['distributor_id = ?', 'deleted_at IS NULL', 'is_active = 1'];
+export async function storefrontProducts(distributorId: number, opts: { q?: string; category?: string; limit?: number; offset?: number; retailerId?: number } = {}) {
+  const where = ['distributor_id = ?', 'deleted_at IS NULL', 'is_active = 1', "review_status = 'approved'"];
   const args: unknown[] = [distributorId];
   if (opts.q) { where.push('(name LIKE ? OR brand LIKE ? OR sku LIKE ? OR barcode = ? OR variant_group LIKE ?)'); const like = `%${opts.q}%`; args.push(like, like, like, opts.q, like); }
   if (opts.category) { where.push('category = ?'); args.push(opts.category); }
   const rows = await q<any>(pool, `SELECT * FROM products WHERE ${where.join(' AND ')} ORDER BY (stock_qty > 0) DESC, COALESCE(variant_group, name), name, variant_label LIMIT ? OFFSET ?`, [...args, opts.limit ?? 200, opts.offset ?? 0]);
   const categories = (await q<any>(pool, 'SELECT DISTINCT category FROM products WHERE distributor_id = ? AND deleted_at IS NULL AND is_active = 1 AND category IS NOT NULL ORDER BY category', [distributorId])).map((r) => r.category as string);
-  return { products: await presentProducts(pool, rows), categories };
+  const products = await presentProducts(pool, rows);
+  if (opts.retailerId) await applyCustomerPrices(products, rows, distributorId, opts.retailerId);
+  return { products, categories };
+}
+
+/**
+ * Replace each product's price and quantity breaks with what THIS retailer pays (standard price, breaks and any price list
+ * that applies to them), in the same shape as before, so the app's "price for quantity" works unchanged. `price_note` says
+ * where a special price comes from. The distributor's list names are shown; nothing about other customers is.
+ */
+async function applyCustomerPrices(products: any[], rows: any[], distributorId: number, retailerId: number) {
+  const prof = await q1<any>(pool, 'SELECT pincode FROM retailer_profiles WHERE user_id = ?', [retailerId]);
+  const ids = rows.map((r) => r.id);
+  const tiers = await loadTiers(pool, ids);
+  const rules = await loadRules(pool, { distributorId, retailerId, pincode: prof?.pincode, productIds: ids });
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  for (const p of products) {
+    const r = rules.get(p.id);
+    if (!r?.length) continue;
+    const row = byId.get(p.id);
+    const t = effectiveTable(Number(row.price_paise), tiers.get(p.id) ?? [], r);
+    const mrp = row.mrp_paise == null ? null : Number(row.mrp_paise);
+    p.price = fromPaise(t.base.unit_paise);
+    p.tiers = t.breaks.map((b) => ({ min_qty: b.min_qty, price: fromPaise(b.resolved.unit_paise) }));
+    p.discount_pct = mrp && mrp > t.base.unit_paise ? Math.round(((mrp - t.base.unit_paise) / mrp) * 100) : 0;
+    const named = t.base.list_name ? t.base : t.breaks.find((b) => b.resolved.list_name)?.resolved;
+    p.price_note = named?.list_name ? (named.kind === 'promotion' ? `Offer: ${named.list_name}` : `Your price: ${named.list_name}`) : null;
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -79,6 +115,9 @@ const productFields = {
   variant_label: optText(60),
   category: optText(80),
   brand: optText(80),
+  category_id: z.number().int().positive().nullable().optional(),
+  cost: money.nullable().optional(),
+  brand_id: z.number().int().positive().nullable().optional(),
   unit: z.string().trim().min(1).max(20).default('pcs'),
   description: optText(500),
   price: money,
@@ -164,12 +203,19 @@ catalogRouter.get('/', requireRole('distributor', 'employee'), asyncHandler(asyn
   const categories = (await q<any>(pool, 'SELECT category, COUNT(*) n FROM products WHERE distributor_id = ? AND deleted_at IS NULL AND category IS NOT NULL GROUP BY category ORDER BY category', [d]))
     .map((r) => ({ name: r.category as string, count: Number(r.n) }));
   res.json({
-    products: await presentProducts(pool, rows), total: Number(total), limit: qs.limit, offset: qs.offset, categories,
+    products: (await presentProducts(pool, rows)).map((p, i) => ({ ...p, cost: rows[i].cost_paise == null ? null : fromPaise(Number(rows[i].cost_paise)) })), total: Number(total), limit: qs.limit, offset: qs.offset, categories,
     summary: { total: Number(s.total), active: Number(s.active), hidden: Number(s.hidden), out_of_stock: Number(s.out_of_stock), low_stock: Number(s.low) },
   });
 }));
 
 // Find a product by scanning its barcode.
+// The managed lists a distributor picks from. Retired entries are not offered.
+catalogRouter.get('/taxonomy', requireRole('distributor', 'employee'), asyncHandler(async (_req, res) => {
+  const categories = await q<any>(pool, "SELECT id, parent_id, name, status FROM categories WHERE status <> 'retired' ORDER BY sort_order, name");
+  const brands = await q<any>(pool, "SELECT id, name, status FROM brands WHERE status <> 'retired' ORDER BY name");
+  res.json({ categories, brands });
+}));
+
 catalogRouter.get('/lookup', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
   const { barcode } = z.object({ barcode: z.string().trim().min(1).max(40) }).parse(req.query);
   const p = await q1<any>(pool, 'SELECT * FROM products WHERE distributor_id = ? AND barcode = ? AND deleted_at IS NULL', [req.auth!.distributorId, barcode]);
@@ -193,7 +239,8 @@ catalogRouter.get('/:id', requireRole('distributor', 'employee'), asyncHandler(a
   const id = idParam(req);
   const p = await q1<any>(pool, 'SELECT * FROM products WHERE id = ? AND distributor_id = ? AND deleted_at IS NULL', [id, req.auth!.distributorId]);
   if (!p) throw notFound('Product');
-  const [product] = await presentProducts(pool, [p]);
+  const [shown] = await presentProducts(pool, [p]);
+  const product = { ...shown, cost: p.cost_paise == null ? null : fromPaise(Number(p.cost_paise)) };
   const movements = await q<any>(pool, `SELECT m.id, m.delta, m.balance_after, m.reason, m.ref_order_id, m.note, m.created_at, u.name AS actor
     FROM stock_movements m LEFT JOIN users u ON u.id = m.actor_id WHERE m.product_id = ? ORDER BY m.id DESC LIMIT 30`, [id]);
   const prices = await q<any>(pool, 'SELECT old_price_paise, new_price_paise, created_at FROM price_history WHERE product_id = ? ORDER BY id DESC LIMIT 15', [id]);
@@ -205,6 +252,12 @@ catalogRouter.get('/:id', requireRole('distributor', 'employee'), asyncHandler(a
   });
 }));
 
+catalogRouter.get('/:id/versions', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
+  const id = idParam(req);
+  if (!(await q1(pool, 'SELECT 1 FROM products WHERE id = ? AND distributor_id = ?', [id, req.auth!.distributorId]))) throw notFound('Product');
+  res.json({ versions: await listVersions(pool, id) });
+}));
+
 // ---------------------------------------------------------------------------------------------
 // Create / edit / delete
 // ---------------------------------------------------------------------------------------------
@@ -212,6 +265,7 @@ catalogRouter.post('/', ...writer, asyncHandler(async (req, res) => {
   const b = createSchema.parse(req.body);
   const d = req.auth!.userId;
   await assertSubscriptionActive(pool, d);
+  await idsToNames(b);
   const price = toPaise(b.price);
   const mrp = b.mrp == null || b.mrp === '' ? null : toPaise(b.mrp);
   const tiers = checkPricing(price, mrp, toTierRows(b.tiers));
@@ -222,6 +276,8 @@ catalogRouter.post('/', ...writer, asyncHandler(async (req, res) => {
       await replaceTiers(c, r.insertId, tiers);
       await recordPrice(c, r.insertId, null, price, d);
       if (b.stock_qty > 0) await changeStock(c, { productId: r.insertId, distributorId: d, delta: b.stock_qty, reason: 'initial', actorId: d });
+      if (b.cost != null && b.cost !== '') await exec(c, 'UPDATE products SET cost_paise = ? WHERE id = ?', [toPaise(b.cost), r.insertId]);
+      await syncProduct(c, r.insertId, d, 'create');
       return r.insertId;
     });
     const p = await q1<any>(pool, 'SELECT * FROM products WHERE id = ?', [id]);
@@ -233,6 +289,7 @@ catalogRouter.post('/', ...writer, asyncHandler(async (req, res) => {
 // sales can never be overwritten by a stale screen.
 catalogRouter.patch('/:id', ...writer, asyncHandler(async (req, res) => {
   const body = patchSchema.parse(req.body);
+  await idsToNames(body);
   if ('stock_qty' in (req.body ?? {})) throw new AppError(400, 'USE_STOCK_ENDPOINT', 'Change stock with POST /catalog/:id/stock');
   const id = idParam(req);
   const d = req.auth!.userId;
@@ -256,6 +313,8 @@ catalogRouter.patch('/:id', ...writer, asyncHandler(async (req, res) => {
         await recordPrice(c, id, Number(cur.price_paise), price, d);
         await audit(d, 'catalog.price_change', 'product', id, { from: fromPaise(Number(cur.price_paise)), to: fromPaise(price) }, c);
       }
+      if (body.cost !== undefined) await exec(c, 'UPDATE products SET cost_paise = ? WHERE id = ?', [body.cost == null || body.cost === '' ? null : toPaise(body.cost), id]);
+      await syncProduct(c, id, d, 'update');
     });
     const p = await q1<any>(pool, 'SELECT * FROM products WHERE id = ?', [id]);
     res.json((await presentProducts(pool, [p]))[0]);
@@ -265,8 +324,8 @@ catalogRouter.patch('/:id', ...writer, asyncHandler(async (req, res) => {
 // Change stock safely. Either add/remove an amount, or set a counted figure while stating what you believed it was.
 catalogRouter.post('/:id/stock', ...writer, asyncHandler(async (req, res) => {
   const b = z.union([
-    z.object({ delta: z.number().int().refine((v) => v !== 0 && Math.abs(v) <= 10_000_000), note: z.string().trim().max(200).optional() }),
-    z.object({ set_to: z.number().int().min(0).max(100_000_000), expected: z.number().int(), note: z.string().trim().max(200).optional() }),
+    z.object({ delta: z.number().int().refine((v) => v !== 0 && Math.abs(v) <= 10_000_000), note: z.string().trim().max(200).optional(), warehouse_id: z.number().int().positive().optional() }),
+    z.object({ set_to: z.number().int().min(0).max(100_000_000), expected: z.number().int(), note: z.string().trim().max(200).optional(), warehouse_id: z.number().int().positive().optional() }),
   ]).parse(req.body);
   const id = idParam(req);
   const d = req.auth!.userId;
@@ -274,10 +333,10 @@ catalogRouter.post('/:id/stock', ...writer, asyncHandler(async (req, res) => {
   const balance = await withTx(async (c) => {
     const cur = await q1<any>(c, 'SELECT stock_qty FROM products WHERE id = ? AND distributor_id = ? AND deleted_at IS NULL FOR UPDATE', [id, d]);
     if (!cur) throw notFound('Product');
-    if ('delta' in b) return changeStock(c, { productId: id, distributorId: d, delta: b.delta, reason: 'manual', note: b.note, actorId: d });
+    if ('delta' in b) return changeStock(c, { productId: id, distributorId: d, delta: b.delta, reason: 'manual', note: b.note, actorId: d, warehouseId: b.warehouse_id });
     // A stock count: only applied if nothing moved since the person looked, otherwise they are told the real number.
     if (cur.stock_qty !== b.expected) throw new AppError(409, 'STOCK_CHANGED', `Stock is now ${cur.stock_qty}, not ${b.expected}. Review it and try again.`, { current: cur.stock_qty });
-    return changeStock(c, { productId: id, distributorId: d, delta: b.set_to - cur.stock_qty, reason: 'correction', note: b.note ?? 'Stock count', actorId: d });
+    return changeStock(c, { productId: id, distributorId: d, delta: b.set_to - cur.stock_qty, reason: 'correction', note: b.note ?? 'Stock count', actorId: d, warehouseId: b.warehouse_id });
   });
   res.json({ stock_qty: balance });
 }));
@@ -294,6 +353,7 @@ catalogRouter.post('/:id/duplicate', ...writer, asyncHandler(async (req, res) =>
     const tiers = (await loadTiers(c, [id])).get(id) ?? [];
     await replaceTiers(c, r.insertId, tiers);
     await recordPrice(c, r.insertId, null, Number(cur.price_paise), d);
+    await syncProduct(c, r.insertId, d, 'duplicate');
     return r.insertId; // starts hidden with no stock, so a copy can never be sold by accident
   });
   res.status(201).json((await presentProducts(pool, [(await q1<any>(pool, 'SELECT * FROM products WHERE id = ?', [id2]))]))[0]);
@@ -418,6 +478,7 @@ catalogRouter.post('/bulk/apply', ...writer, asyncHandler(async (req, res) => {
         await exec(c, 'UPDATE product_price_tiers SET price_paise = ROUND(price_paise * ?) WHERE product_id = ?', [1 + pct / 100, p.id]);
         await recordPrice(c, p.id, Number(p.price_paise), next, d);
       }
+      await syncProduct(c, p.id, d, `bulk_${b.action}`);
     }
     await audit(d, `catalog.bulk_${b.action}`, 'product', null, { ids: rows.map((r) => r.id), value: b.value ?? null }, c);
     return rows.length;
@@ -476,12 +537,14 @@ catalogRouter.post('/import/rows', ...writer, asyncHandler(async (req, res) => {
             r.hsn ?? existing.hsn, r.gst === undefined ? existing.gst_rate_bps : gstBps, r.min_order_qty ?? existing.min_order_qty, r.low_stock_threshold ?? existing.low_stock_threshold, existing.id]);
           await recordPrice(c, existing.id, Number(existing.price_paise), price, d);
           if (r.stock !== undefined && r.stock !== existing.stock_qty) await changeStock(c, { productId: existing.id, distributorId: d, delta: r.stock - existing.stock_qty, reason: 'import', actorId: d });
+          await syncProduct(c, existing.id, d, 'import_update');
           updated++;
         } else {
           const ins = await exec(c, `INSERT INTO products (distributor_id, name, sku, category, brand, unit, description, price_paise, mrp_paise, stock_qty, min_order_qty, low_stock_threshold, hsn, gst_rate_bps, is_active)
             VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,1)`, [d, r.name, r.sku ?? null, r.category ?? null, r.brand ?? null, r.unit || 'pcs', r.description ?? null, price, mrp, r.min_order_qty ?? 1, r.low_stock_threshold ?? 10, r.hsn ?? null, gstBps]);
           await recordPrice(c, ins.insertId, null, price, d);
           if (r.stock) await changeStock(c, { productId: ins.insertId, distributorId: d, delta: r.stock, reason: 'import', actorId: d });
+          await syncProduct(c, ins.insertId, d, 'import_create');
           created++;
         }
       } catch (e: any) {

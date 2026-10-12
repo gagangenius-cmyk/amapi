@@ -9,8 +9,11 @@ import { idParam } from '../../utils/http';
 import { assertPermission, assertSubscriptionActive, loadDistributor } from '../distributors/subscription';
 import { notifyUsers, teamOf } from '../../services/notify';
 import { allocateFefo, releaseAllocations } from '../catalog/batches';
+import { reservedByProduct } from '../inventory/inventory.service';
 import { displayName } from '../catalog/catalog.routes';
-import { changeStock, loadTiers, priceForQty } from '../catalog/stock';
+import { changeStock, loadTiers } from '../catalog/stock';
+import { loadRules, resolvePrice } from '../pricing/resolver';
+import { earnCommission, snapshotFor } from '../commission/commission.service';
 import { postLedger } from '../ledger/ledger.service';
 import { storeAccess } from '../retailers/access';
 
@@ -33,7 +36,8 @@ const present = (o: any, items?: any[]) => ({
   is_out_of_hierarchy: !!o.is_out_of_hierarchy, commission_rate_bps: o.commission_rate_bps, assigned_employee_id: o.assigned_employee_id,
   created_at: o.created_at, invoice_no: o.invoice_no ?? null, is_adjusted: !!o.is_adjusted,
   ...(o.retailer_name !== undefined && { retailer_name: o.retailer_name, distributor_name: o.distributor_name, item_count: Number(o.item_count) }),
-  ...(items && { items: items.map((i) => ({ product_id: i.product_id, name: i.name, qty: i.qty, ordered_qty: i.ordered_qty ?? i.qty, unit_price: fromPaise(Number(i.unit_price_paise)), gst_rate_bps: i.gst_rate_bps, line_total: fromPaise(Number(i.line_total_paise)) })) }),
+  ...(items && { items: items.map((i) => ({ product_id: i.product_id, name: i.name, qty: i.qty, ordered_qty: i.ordered_qty ?? i.qty, unit_price: fromPaise(Number(i.unit_price_paise)), gst_rate_bps: i.gst_rate_bps, line_total: fromPaise(Number(i.line_total_paise)),
+    standard_unit_price: i.standard_unit_price_paise == null ? null : fromPaise(Number(i.standard_unit_price_paise)), price_list: i.price_list_name ?? null, price_basis: i.price_basis ?? null })) }),
 });
 
 orderRouter.post('/', requireRole('retailer'), asyncHandler(async (req, res) => {
@@ -58,21 +62,28 @@ orderRouter.post('/', requireRole('retailer'), asyncHandler(async (req, res) => 
     const dist = await assertSubscriptionActive(c, b.distributor_id);
     const ids = [...new Set(b.items.map((i) => i.product_id))];
     if (ids.length !== b.items.length) throw new AppError(400, 'DUPLICATE_ITEM', 'Each product may appear once');
-    const products = await q<any>(c, 'SELECT * FROM products WHERE id IN (?) AND distributor_id = ? AND deleted_at IS NULL AND is_active = 1', [ids, b.distributor_id]);
+    const products = await q<any>(c, "SELECT * FROM products WHERE id IN (?) AND distributor_id = ? AND deleted_at IS NULL AND is_active = 1 AND review_status = 'approved' ORDER BY id FOR UPDATE", [ids, b.distributor_id]);   // locked: parallel orders for the same product queue up here
     if (products.length !== ids.length) throw new AppError(400, 'BAD_PRODUCT', 'Unknown or unavailable product');
     const byId = new Map(products.map((p) => [p.id, p]));
+    // Stock already promised to orders waiting for acceptance is not available to this one (read under the lock above).
+    const reserved = await reservedByProduct(c, ids, b.distributor_id, true);
 
     const tiers = await loadTiers(c, ids);
+    const prof = await q1<any>(c, 'SELECT pincode FROM retailer_profiles WHERE user_id = ?', [retailerId]);
+    const rules = await loadRules(c, { distributorId: b.distributor_id, retailerId, pincode: prof?.pincode, productIds: ids });
     let total = 0;
     const lines = b.items.map((i) => {
       const p = byId.get(i.product_id);
       if (i.qty < p.min_order_qty) throw new AppError(400, 'MIN_QTY', `Minimum order for ${p.name} is ${p.min_order_qty} ${p.unit}`);
-      if (p.stock_qty < i.qty) throw new AppError(409, 'OUT_OF_STOCK', `Insufficient stock for ${p.name}`);
+      const available = p.stock_qty - (reserved.get(p.id) ?? 0);
+      if (available < i.qty) throw new AppError(409, 'OUT_OF_STOCK', `Insufficient stock for ${p.name}`, { available: Math.max(0, available) });
       // quantity-break pricing: a bigger quantity can unlock a lower unit price
-      const unit = priceForQty(Number(p.price_paise), tiers.get(p.id) ?? [], i.qty);
+      // standard price and break, then any price list that applies to this retailer (see modules/pricing/resolver.ts)
+      const priced = resolvePrice(Number(p.price_paise), tiers.get(p.id) ?? [], rules.get(p.id) ?? [], i.qty);
+      const unit = priced.unit_paise;
       const line = withGst(unit * i.qty, p.gst_rate_bps);
       total += line;
-      return { p, qty: i.qty, unit, line };
+      return { p, qty: i.qty, unit, line, priced };
     });
 
     // The link between them (locked, so parallel orders can not both slip under a credit limit).
@@ -102,11 +113,13 @@ orderRouter.post('/', requireRole('retailer'), asyncHandler(async (req, res) => 
     if (!primary) await exec(c, 'UPDATE retailer_distributor_relations SET is_primary = 1 WHERE retailer_id = ? AND distributor_id = ?', [retailerId, b.distributor_id]);
     else outOfHierarchy = primary.distributor_id !== b.distributor_id && relNow.requested_by !== 'distributor';
 
+    // Outside the hierarchy the order carries commission: fix the rule for each line now, so a later rule change cannot touch it.
+    const commission = outOfHierarchy ? await snapshotFor(c, b.distributor_id, dist.commission_rate_bps, lines.map((l) => ({ id: l.p.id, category_id: l.p.category_id ?? null }))) : null;
     const o = await exec(c, 'INSERT INTO orders (retailer_id, distributor_id, total_paise, is_out_of_hierarchy, commission_rate_bps, idempotency_key, request_hash) VALUES (?,?,?,?,?,?,?)', [
       retailerId, b.distributor_id, total, outOfHierarchy ? 1 : 0, outOfHierarchy ? dist.commission_rate_bps : 0, key, fingerprint,
     ]);
-    await exec(c, 'INSERT INTO order_items (order_id, product_id, name, qty, unit_price_paise, gst_rate_bps, line_total_paise) VALUES ?', [
-      lines.map((l) => [o.insertId, l.p.id, displayName(l.p).slice(0, 190), l.qty, l.unit, l.p.gst_rate_bps, l.line]),
+    await exec(c, 'INSERT INTO order_items (order_id, product_id, name, qty, unit_price_paise, gst_rate_bps, line_total_paise, standard_unit_price_paise, price_list_id, price_list_name, price_basis, commission_mode, commission_value, commission_rule_id) VALUES ?', [
+      lines.map((l) => { const cm = commission?.get(l.p.id); return [o.insertId, l.p.id, displayName(l.p).slice(0, 190), l.qty, l.unit, l.p.gst_rate_bps, l.line, l.priced.standard_paise, l.priced.list_id, l.priced.list_name, l.priced.basis, cm?.mode ?? null, cm?.value ?? null, cm?.rule_id ?? null]; }),
     ]);
     await exec(c, "INSERT INTO order_events (order_id, from_status, to_status, actor_id) VALUES (?,NULL,'placed',?)", [o.insertId, retailerId]);
     return { order: await q1<any>(c, 'SELECT * FROM orders WHERE id = ?', [o.insertId]), replayed: false };
@@ -257,6 +270,7 @@ orderRouter.post('/:id/transition', asyncHandler(async (req, res) => {
 
     await exec(c, 'UPDATE orders SET status = ? WHERE id = ?', [to, o.id]);
     await exec(c, 'INSERT INTO order_events (order_id, from_status, to_status, actor_id) VALUES (?,?,?,?)', [o.id, o.status, to, a.userId]);
+    if (to === 'delivered') await earnCommission(c, o.id);
     return q1<any>(c, 'SELECT * FROM orders WHERE id = ?', [o.id]);
   });
   const label = to.replace(/_/g, ' ');

@@ -158,6 +158,7 @@ authRouter.post('/login', asyncHandler(async (req, res) => {
   }
   await requireSecondFactor(u, b.totp);
   if (u.failed_logins || u.locked_until) await exec(pool, 'UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = ?', [u.id]);
+  await audit(u.id, 'auth.login', 'user', u.id, { via: 'password', ip: req.ip ?? null, device: String(req.headers['user-agent'] ?? '').slice(0, 120) });
   res.json({ id: u.id, role: u.role, ...(await issueTokens(u.id, u.role, u.owner_distributor_id, { req })) });
 }));
 
@@ -220,7 +221,8 @@ authRouter.post('/otp/verify', asyncHandler(async (req, res) => {
     await exec(pool, 'UPDATE refresh_tokens SET revoked_at = UTC_TIMESTAMP() WHERE user_id = ? AND revoked_at IS NULL', [u.id]);
     await audit(u.id, 'auth.password_reset', 'user', u.id);
   }
-  res.json({ id: u.id, role: u.role, ...(await issueTokens(u.id, u.role, u.owner_distributor_id)) });
+  await audit(u.id, b.purpose === 'login' ? 'auth.login' : 'auth.password_reset_login', 'user', u.id, { via: 'email_code', ip: req.ip ?? null, device: String(req.headers['user-agent'] ?? '').slice(0, 120) });
+  res.json({ id: u.id, role: u.role, ...(await issueTokens(u.id, u.role, u.owner_distributor_id, { req })) });
 }));
 
 // ---------- confirm the account's email ----------
@@ -243,10 +245,10 @@ authRouter.post('/email/verify', authenticate, asyncHandler(async (req, res) => 
   res.json({ verified: true });
 }));
 
-// ---------- two-factor (authenticator app) for admin accounts ----------
+// ---------- two-factor (authenticator app) for admin and company-employee accounts ----------
 authRouter.post('/2fa/setup', authenticate, asyncHandler(async (req, res) => {
   const u = await q1<any>(pool, 'SELECT id, phone, totp_enabled_at FROM users WHERE id = ?', [req.auth!.userId]);
-  if (req.auth!.role !== 'admin') throw new AppError(403, 'FORBIDDEN', 'Two-factor is for admin accounts');
+  if (req.auth!.role !== 'admin' && req.auth!.role !== 'company_employee') throw new AppError(403, 'FORBIDDEN', 'Two-factor is for admin and company-employee accounts');
   if (u.totp_enabled_at) throw new AppError(409, 'ALREADY_ENABLED', 'Two-factor is already on');
   const secret = totp.newSecret();
   await exec(pool, 'UPDATE users SET totp_secret = ? WHERE id = ?', [totp.seal(secret), u.id]);

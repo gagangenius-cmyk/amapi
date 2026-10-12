@@ -7,6 +7,7 @@ import { audit } from '../../utils/audit';
 import { AppError, asyncHandler, notFound } from '../../utils/errors';
 import { idParam } from '../../utils/http';
 import { fromPaise, withGst } from '../../utils/money';
+import { reverseCommission } from '../commission/commission.service';
 import { changeStock } from '../catalog/stock';
 import { assertSubscriptionActive, loadDistributor } from '../distributors/subscription';
 import { postLedger } from '../ledger/ledger.service';
@@ -120,6 +121,7 @@ returnsRouter.post('/:id/resolve', requireRole('distributor'), asyncHandler(asyn
     await exec(c, 'UPDATE order_returns SET status = ?, restock = ?, resolution_note = ?, resolved_by = ?, resolved_at = UTC_TIMESTAMP() WHERE id = ?', [
       b.action === 'approve' ? 'approved' : 'rejected', b.action === 'approve' && b.restock ? 1 : 0, b.note ?? null, actor, r.id,
     ]);
+    if (b.action === 'approve') await reverseCommission(c, r.id);
     return q1<any>(c, 'SELECT * FROM order_returns WHERE id = ?', [r.id]);
   });
   await audit(actor, `return.${b.action}`, 'order', done.order_id, { return_id: done.id });

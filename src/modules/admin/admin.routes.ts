@@ -7,32 +7,39 @@ import { AppError, asyncHandler } from '../../utils/errors';
 import { idParam } from '../../utils/http';
 import { fromPaise } from '../../utils/money';
 import { reconcile } from '../collections/collections.routes';
-import { DEFAULT_PERMISSIONS, PERMISSION_CATALOG } from '../distributors/subscription';
+import { PERMISSION_CATALOG } from '../distributors/subscription';
 import { afterConfirm, companyPayment, confirmSubscriptionPayment } from '../subscription/subscription.service';
 import { notifyUsers } from '../../services/notify';
 import { toPaise } from '../../utils/money';
 import { withTx } from '../../db/pool';
+import bcrypt from 'bcryptjs';
+import { adminReportsRouter } from '../reports/admin.reports.routes';
+import { adminCatalogRouter } from '../catalog/admin.catalog.routes';
+import { adminCommissionRouter } from '../commission/commission.routes';
+import { cleanActions, cleanGrantable, effectivePermissions, parseStaffPermissions, STAFF_ACTIONS } from '../staff/permissions';
+import { assertIdentityFree, commissionReport, createDistributorAccount, distributorBody, dupToConflict, listDistributors } from '../staff/staff.service';
 
 export const adminRouter = Router();
 adminRouter.use(authenticate, requireRole('admin'), requireTwoFactor);
+adminRouter.use(adminReportsRouter);
+adminRouter.use(adminCatalogRouter);
+adminRouter.use(adminCommissionRouter);
 
 adminRouter.get('/distributors', asyncHandler(async (_req, res) => {
-  const rows = await q<any>(pool, `
-    SELECT dp.user_id id, dp.business_name, dp.plan_name, u.phone, dp.subscription_ends_at, dp.permissions, dp.commission_rate_bps,
-      (SELECT COUNT(*) FROM retailer_distributor_relations r WHERE r.distributor_id = dp.user_id) retailers,
-      (SELECT COUNT(*) FROM orders o WHERE o.distributor_id = dp.user_id) orders
-    FROM distributor_profiles dp JOIN users u ON u.id = dp.user_id ORDER BY dp.subscription_ends_at`);
-  res.json({ permission_catalog: PERMISSION_CATALOG, distributors: rows.map((r) => ({ ...r, permissions: { ...DEFAULT_PERMISSIONS, ...JSON.parse(r.permissions) }, retailers: Number(r.retailers), orders: Number(r.orders) })) });
+  res.json({ permission_catalog: PERMISSION_CATALOG, distributors: await listDistributors('1=1', []) });
+}));
+
+// The admin opens a distributor account directly (all switches on unless told otherwise, subscription length is theirs to choose).
+adminRouter.post('/distributors', asyncHandler(async (req, res) => {
+  const b = distributorBody.parse(req.body);
+  const out = await createDistributorAccount(b, req.auth!.userId, null);
+  await audit(req.auth!.userId, 'admin.distributor_create', 'user', out.id, { phone: b.phone });
+  res.status(201).json({ id: out.id, phone: b.phone, business_name: b.business_name, permissions: out.permissions });
 }));
 
 // Orders placed with non-pinned distributors, for commission tracking.
 adminRouter.get('/commissions', asyncHandler(async (_req, res) => {
-  const rows = await q<any>(pool, `
-    SELECT o.distributor_id, dp.business_name, COUNT(*) orders, SUM(o.total_paise) gross_paise,
-      SUM(ROUND(o.total_paise * o.commission_rate_bps / 10000)) commission_paise
-    FROM orders o JOIN distributor_profiles dp ON dp.user_id = o.distributor_id
-    WHERE o.is_out_of_hierarchy = 1 AND o.status = 'delivered' GROUP BY o.distributor_id, dp.business_name`);
-  res.json({ commissions: rows.map((r) => ({ ...r, orders: Number(r.orders), gross_paise: Number(r.gross_paise), commission_paise: Number(r.commission_paise) })) });
+  res.json({ commissions: await commissionReport() });
 }));
 
 // Platform KPIs for the console header.
@@ -69,7 +76,7 @@ adminRouter.get('/audit', asyncHandler(async (req, res) => {
 }));
 
 adminRouter.get('/users', asyncHandler(async (req, res) => {
-  const qs = z.object({ q: z.string().trim().max(100).optional(), role: z.enum(['admin', 'distributor', 'employee', 'retailer']).optional(), limit: z.coerce.number().int().min(1).max(100).default(50) }).parse(req.query);
+  const qs = z.object({ q: z.string().trim().max(100).optional(), role: z.enum(['admin', 'distributor', 'employee', 'retailer', 'company_employee']).optional(), limit: z.coerce.number().int().min(1).max(100).default(50) }).parse(req.query);
   const where = ['1=1']; const args: unknown[] = [];
   if (qs.role) { where.push('u.role = ?'); args.push(qs.role); }
   if (qs.q) { where.push('(u.name LIKE ? OR u.phone LIKE ? OR u.email LIKE ?)'); const l = `%${qs.q}%`; args.push(l, l, l); }
@@ -93,6 +100,145 @@ adminRouter.post('/users/:id/status', asyncHandler(async (req, res) => {
   invalidateUser(id);
   await audit(req.auth!.userId, is_active ? 'admin.user_restored' : 'admin.user_suspended', 'user', id, { reason });
   res.json({ id, is_active });
+}));
+
+// ---------------------------------------------------------------------------------------------
+// Company employees: the admin creates them and decides what each may do and which
+// distributor feature switches they may hand out.
+// ---------------------------------------------------------------------------------------------
+const presentStaff = (r: any) => {
+  const p = effectivePermissions(r);
+  return {
+    id: r.id, name: r.name, phone: r.phone, email: r.email, is_active: !!r.is_active, actions: p.actions, grantable: p.grantable,
+    role_id: r.role_id ?? null, role_name: r.role_name ?? null, created_at: r.created_at, distributors_created: Number(r.distributors_created ?? 0),
+  };
+};
+const STAFF_SELECT = `SELECT u.id, u.name, u.phone, u.email, u.is_active, u.staff_permissions, u.role_id, u.created_at,
+  ro.name role_name, ro.actions role_actions, ro.grantable role_grantable,
+  (SELECT COUNT(*) FROM users d WHERE d.created_by = u.id AND d.role = 'distributor') distributors_created
+  FROM users u LEFT JOIN roles ro ON ro.id = u.role_id`;
+
+// ---- named roles ----
+const presentRole = (r: any) => ({
+  id: r.id, name: r.name, description: r.description, is_system: !!r.is_system,
+  actions: cleanActions(JSON.parse(r.actions)),
+  grantable: cleanGrantable(JSON.parse(r.grantable)),
+  members: Number(r.members ?? 0),
+});
+const ROLE_SELECT = 'SELECT r.*, (SELECT COUNT(*) FROM users u WHERE u.role_id = r.id) members FROM roles r';
+const roleBody = z.object({
+  name: z.string().trim().min(2).max(60), description: z.string().trim().max(200).nullable().optional(),
+  actions: z.array(z.string()).max(50), grantable: z.array(z.string()).max(50),
+});
+
+adminRouter.get('/roles', asyncHandler(async (_req, res) => {
+  res.json({ action_catalog: STAFF_ACTIONS, grant_catalog: PERMISSION_CATALOG, roles: (await q<any>(pool, `${ROLE_SELECT} ORDER BY r.is_system DESC, r.name`)).map(presentRole) });
+}));
+
+adminRouter.post('/roles', asyncHandler(async (req, res) => {
+  const b = roleBody.parse(req.body);
+  let id: number;
+  try {
+    const r = await exec(pool, 'INSERT INTO roles (name, description, actions, grantable, created_by) VALUES (?,?,?,?,?)', [
+      b.name, b.description ?? null, JSON.stringify(cleanActions(b.actions)), JSON.stringify(cleanGrantable(b.grantable)), req.auth!.userId,
+    ]);
+    id = r.insertId;
+  } catch (e: any) {
+    if (e?.code === 'ER_DUP_ENTRY') throw new AppError(409, 'ROLE_EXISTS', 'A role with this name already exists');
+    throw e;
+  }
+  await audit(req.auth!.userId, 'admin.role_create', 'role', id, { name: b.name });
+  res.status(201).json(presentRole((await q1<any>(pool, `${ROLE_SELECT} WHERE r.id = ?`, [id]))));
+}));
+
+adminRouter.put('/roles/:id', asyncHandler(async (req, res) => {
+  const b = roleBody.partial().refine((v) => Object.keys(v).length > 0, 'Nothing to change').parse(req.body);
+  const id = idParam(req);
+  const cur = await q1<any>(pool, 'SELECT * FROM roles WHERE id = ?', [id]);
+  if (!cur) throw new AppError(404, 'NOT_FOUND', 'Role not found');
+  if (cur.is_system) throw new AppError(409, 'SYSTEM_ROLE', 'Built-in roles cannot be changed. Create a copy with the powers you want.');
+  try {
+    await exec(pool, 'UPDATE roles SET name = ?, description = ?, actions = ?, grantable = ? WHERE id = ?', [
+      b.name ?? cur.name, b.description === undefined ? cur.description : b.description,
+      b.actions ? JSON.stringify(cleanActions(b.actions)) : cur.actions, b.grantable ? JSON.stringify(cleanGrantable(b.grantable)) : cur.grantable, id,
+    ]);
+  } catch (e: any) {
+    if (e?.code === 'ER_DUP_ENTRY') throw new AppError(409, 'ROLE_EXISTS', 'A role with this name already exists');
+    throw e;
+  }
+  await audit(req.auth!.userId, 'admin.role_update', 'role', id, b);
+  res.json(presentRole((await q1<any>(pool, `${ROLE_SELECT} WHERE r.id = ?`, [id]))));
+}));
+
+adminRouter.delete('/roles/:id', asyncHandler(async (req, res) => {
+  const id = idParam(req);
+  const cur = await q1<any>(pool, `${ROLE_SELECT} WHERE r.id = ?`, [id]);
+  if (!cur) throw new AppError(404, 'NOT_FOUND', 'Role not found');
+  if (cur.is_system) throw new AppError(409, 'SYSTEM_ROLE', 'Built-in roles cannot be deleted');
+  if (Number(cur.members) > 0) throw new AppError(409, 'ROLE_IN_USE', `${cur.members} employee${Number(cur.members) === 1 ? ' holds' : 's hold'} this role. Move them to another role first.`);
+  await exec(pool, 'DELETE FROM roles WHERE id = ?', [id]);
+  await audit(req.auth!.userId, 'admin.role_delete', 'role', id, { name: cur.name });
+  res.status(204).end();
+}));
+
+adminRouter.get('/staff', asyncHandler(async (_req, res) => {
+  const rows = await q<any>(pool, `${STAFF_SELECT} WHERE u.role = 'company_employee' ORDER BY u.id DESC`);
+  res.json({ action_catalog: STAFF_ACTIONS, grant_catalog: PERMISSION_CATALOG, staff: rows.map(presentStaff) });
+}));
+
+adminRouter.post('/staff', asyncHandler(async (req, res) => {
+  const b = z.object({
+    phone: z.string().regex(/^\d{10}$/, '10-digit phone'), name: z.string().trim().min(2).max(120), password: z.string().min(8).max(100),
+    email: z.string().trim().toLowerCase().email().max(190).optional(),
+    actions: z.array(z.string()).max(50).default([]), grantable: z.array(z.string()).max(50).default([]),
+    role_id: z.number().int().positive().nullable().optional(),
+  }).parse(req.body);
+  const perms = { actions: cleanActions(b.actions), grantable: cleanGrantable(b.grantable) };
+  if (b.role_id && !(await q1(pool, 'SELECT id FROM roles WHERE id = ?', [b.role_id]))) throw new AppError(400, 'BAD_ROLE', 'Unknown role');
+  const hash = await bcrypt.hash(b.password, 10);
+  let id: number;
+  try {
+    id = await withTx(async (c) => {
+      await assertIdentityFree(c, b.phone, b.email);
+      const r = await exec(c, "INSERT INTO users (role, phone, email, name, password_hash, created_by, staff_permissions, role_id) VALUES ('company_employee',?,?,?,?,?,?,?)", [
+        b.phone, b.email ?? null, b.name, hash, req.auth!.userId, JSON.stringify(perms), b.role_id ?? null,
+      ]);
+      return r.insertId as number;
+    });
+  } catch (e) { return dupToConflict(e); }
+  await audit(req.auth!.userId, 'admin.staff_create', 'user', id, { phone: b.phone, role_id: b.role_id ?? null, ...perms });
+  res.status(201).json(presentStaff((await q1<any>(pool, `${STAFF_SELECT} WHERE u.id = ?`, [id]))));
+}));
+
+adminRouter.put('/staff/:id', asyncHandler(async (req, res) => {
+  const b = z.object({
+    name: z.string().trim().min(2).max(120).optional(), is_active: z.boolean().optional(),
+    actions: z.array(z.string()).max(50).optional(), grantable: z.array(z.string()).max(50).optional(),
+    role_id: z.number().int().positive().nullable().optional(),
+    password: z.string().min(8).max(100).optional(),
+  }).refine((v) => Object.keys(v).length > 0, 'Nothing to change').parse(req.body);
+  const id = idParam(req);
+  const cur = await q1<any>(pool, `${STAFF_SELECT} WHERE u.id = ? AND u.role = 'company_employee'`, [id]);
+  if (!cur) throw new AppError(404, 'NOT_FOUND', 'Company employee not found');
+  if (b.role_id && !(await q1(pool, 'SELECT id FROM roles WHERE id = ?', [b.role_id]))) throw new AppError(400, 'BAD_ROLE', 'Unknown role');
+
+  // Choosing a role hands the powers to that role. Editing the powers directly makes them "custom" (no role).
+  const own = effectivePermissions({ staff_permissions: cur.staff_permissions });
+  const was = effectivePermissions(cur);
+  let roleId: number | null = cur.role_id ?? null;
+  let perms = own;
+  if (b.role_id !== undefined) roleId = b.role_id;
+  else if (b.actions || b.grantable) { roleId = null; perms = was; }
+  if (b.actions || b.grantable) perms = { actions: b.actions ? cleanActions(b.actions) : perms.actions, grantable: b.grantable ? cleanGrantable(b.grantable) : perms.grantable };
+
+  await exec(pool, 'UPDATE users SET name = COALESCE(?, name), is_active = COALESCE(?, is_active), staff_permissions = ?, role_id = ?, password_hash = COALESCE(?, password_hash) WHERE id = ?', [
+    b.name ?? null, b.is_active === undefined ? null : b.is_active ? 1 : 0, JSON.stringify(perms), roleId, b.password ? await bcrypt.hash(b.password, 10) : null, id,
+  ]);
+  // a switched-off person, or a new password, ends their sessions at once
+  if (b.is_active === false || b.password) await exec(pool, 'UPDATE refresh_tokens SET revoked_at = UTC_TIMESTAMP() WHERE user_id = ? AND revoked_at IS NULL', [id]);
+  invalidateUser(id);
+  await audit(req.auth!.userId, 'admin.staff_update', 'user', id, { ...b, password: b.password ? '(changed)' : undefined });
+  res.json(presentStaff((await q1<any>(pool, `${STAFF_SELECT} WHERE u.id = ?`, [id]))));
 }));
 
 // Money check across the whole platform: anything here needs a human.

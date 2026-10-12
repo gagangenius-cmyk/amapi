@@ -41,7 +41,7 @@ retailerRouter.get('/stores', asyncHandler(async (req, res) => {
     };
   };
   const primaryRow = linked.find((r) => r.is_primary);
-  const primary = primaryRow ? { ...card(primaryRow), ...(await storefrontProducts(primaryRow.id, { limit: PREVIEW })), product_count: await countProducts(primaryRow.id) } : null;
+  const primary = primaryRow ? { ...card(primaryRow), ...(await storefrontProducts(primaryRow.id, { limit: PREVIEW, retailerId })), product_count: await countProducts(primaryRow.id) } : null;
   const others = linked.filter((r) => !r.is_primary).map(card);
   const nearby = (await nearbyDistributors(pool, retailerId, pincode)).map((o) => ({ id: o.id, business_name: o.business_name, city: o.city ?? null, is_pinned: false, linked: false, commission_applicable: true }));
 
@@ -56,7 +56,7 @@ retailerRouter.get('/stores', asyncHandler(async (req, res) => {
   });
 }));
 
-const countProducts = async (distributorId: number) => Number((await q1<any>(pool, 'SELECT COUNT(*) n FROM products WHERE distributor_id = ? AND deleted_at IS NULL AND is_active = 1', [distributorId]))!.n);
+const countProducts = async (distributorId: number) => Number((await q1<any>(pool, "SELECT COUNT(*) n FROM products WHERE distributor_id = ? AND deleted_at IS NULL AND is_active = 1 AND review_status = 'approved'", [distributorId]))!.n);
 
 /** A store's profile page. Only for stores this retailer may see. */
 retailerRouter.get('/stores/:distributorId', asyncHandler(async (req, res) => {
@@ -91,7 +91,7 @@ retailerRouter.get('/stores/:distributorId/products', asyncHandler(async (req, r
   if (!(await storeAccess(pool, req.auth!.userId, id))) throw notFound('Store');
   const qs = z.object({ q: z.string().trim().max(100).optional(), category: z.string().trim().max(80).optional(),
     limit: z.coerce.number().int().min(1).max(200).default(100), offset: z.coerce.number().int().min(0).default(0) }).parse(req.query);
-  res.json(await storefrontProducts(id, qs));
+  res.json(await storefrontProducts(id, { ...qs, retailerId: req.auth!.userId }));
 }));
 
 // Pin a distributor as primary (exclusive).

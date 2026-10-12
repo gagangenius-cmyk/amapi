@@ -80,8 +80,8 @@ distributorRouter.post('/employees', requireRole('distributor'), asyncHandler(as
   await assertPermission(pool, id, 'employees_enabled');
   if (await q1(pool, 'SELECT id FROM users WHERE phone = ?', [b.phone])) throw new AppError(409, 'PHONE_TAKEN', 'Phone already registered');
   if (b.email && (await q1(pool, 'SELECT id FROM users WHERE email = ?', [b.email]))) throw new AppError(409, 'EMAIL_TAKEN', 'Email already registered');
-  const r = await exec(pool, "INSERT INTO users (role, phone, email, name, password_hash, owner_distributor_id) VALUES ('employee',?,?,?,?,?)", [
-    b.phone, b.email ?? null, b.name, await bcrypt.hash(b.password, 10), id,
+  const r = await exec(pool, "INSERT INTO users (role, phone, email, name, password_hash, owner_distributor_id, created_by) VALUES ('employee',?,?,?,?,?,?)", [
+    b.phone, b.email ?? null, b.name, await bcrypt.hash(b.password, 10), id, id,
   ]);
   await audit(id, 'employee.create', 'user', r.insertId, { phone: b.phone });
   res.status(201).json({ id: r.insertId, phone: b.phone, name: b.name });
@@ -93,11 +93,12 @@ const OPEN = "('accepted','dispatched','out_for_delivery')";
 distributorRouter.get('/employees', requireRole('distributor'), asyncHandler(async (req, res) => {
   const rows = await q<any>(pool, `
     SELECT u.id, u.name, u.phone, u.is_active, u.is_available,
+      (SELECT COUNT(*) FROM users r WHERE r.managed_by_id = u.id AND r.role = 'retailer') retailers,
       (SELECT COUNT(*) FROM orders o WHERE o.assigned_employee_id = u.id AND o.status IN ${OPEN}) open_orders,
       (SELECT COUNT(*) FROM orders o WHERE o.assigned_employee_id = u.id AND o.status = 'delivered'
          AND EXISTS (SELECT 1 FROM order_events e WHERE e.order_id = o.id AND e.to_status = 'delivered' AND e.created_at >= UTC_DATE())) delivered_today
     FROM users u WHERE u.role = 'employee' AND u.owner_distributor_id = ? ORDER BY u.name`, [req.auth!.userId]);
-  res.json({ employees: rows.map((r) => ({ ...r, is_active: !!r.is_active, is_available: !!r.is_available, open_orders: Number(r.open_orders), delivered_today: Number(r.delivered_today) })) });
+  res.json({ employees: rows.map((r) => ({ ...r, is_active: !!r.is_active, is_available: !!r.is_available, open_orders: Number(r.open_orders), delivered_today: Number(r.delivered_today), retailers: Number(r.retailers) })) });
 }));
 
 // Mark someone on leave / back, or switch their login off.
@@ -153,6 +154,54 @@ distributorRouter.get('/deliveries', requireRole('distributor'), asyncHandler(as
   });
 }));
 
+// Open a retailer's account directly. The distributor, or any of their employees, does this on the retailer's behalf:
+// the retailer is linked to the distributor at once (no request to accept) and signs in with the password they are given.
+// A distributor may place the retailer under one of their employees ("tree"); an employee's retailers sit under that employee.
+distributorRouter.post('/retailer-accounts', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
+  const b = z.object({
+    phone: z.string().regex(/^\d{10}$/, '10-digit phone'), name: z.string().trim().min(2).max(120), password: z.string().min(8).max(100),
+    email: z.string().trim().toLowerCase().email().max(190).optional(),
+    shop_name: z.string().trim().min(2).max(190), pincode: z.string().regex(/^\d{6}$/, 'Pincode is 6 digits'),
+    address: z.string().trim().min(3).max(255).optional(),
+    gst_no: z.string().trim().toUpperCase().regex(/^\d{2}[A-Z0-9]{13}$/, 'GSTIN must be 15 characters').optional(),
+    managed_by_id: z.number().int().positive().optional(),
+  }).parse(req.body);
+  const actor = req.auth!.userId;
+  const distributorId = req.auth!.distributorId!;
+  await assertSubscriptionActive(pool, distributorId);
+
+  let managedBy: number | null = null;
+  if (req.auth!.role === 'employee') {
+    managedBy = actor;   // an employee's retailers always sit under that employee
+  } else if (b.managed_by_id) {
+    const e = await q1(pool, "SELECT id FROM users WHERE id = ? AND role = 'employee' AND owner_distributor_id = ? AND is_active = 1", [b.managed_by_id, distributorId]);
+    if (!e) throw new AppError(400, 'BAD_EMPLOYEE', 'Choose one of your own team members');
+    managedBy = b.managed_by_id;
+  }
+
+  const hash = await bcrypt.hash(b.password, 10);
+  let id: number;
+  try {
+    id = await withTx(async (c) => {
+      if (await q1(c, 'SELECT id FROM users WHERE phone = ?', [b.phone])) throw new AppError(409, 'PHONE_TAKEN', 'This phone number is already registered. Use "Invite a retailer" to link an existing retailer.');
+      if (b.email) {
+        await exec(c, 'UPDATE users SET email = NULL WHERE email = ? AND email_verified_at IS NULL', [b.email]);
+        if (await q1(c, 'SELECT id FROM users WHERE email = ?', [b.email])) throw new AppError(409, 'EMAIL_TAKEN', 'Email already registered');
+      }
+      const u = await exec(c, "INSERT INTO users (role, phone, email, name, password_hash, created_by, managed_by_id) VALUES ('retailer',?,?,?,?,?,?)", [b.phone, b.email ?? null, b.name, hash, actor, managedBy]);
+      await exec(c, 'INSERT INTO retailer_profiles (user_id, shop_name, pincode, address, gst_no) VALUES (?,?,?,?,?)', [u.insertId, b.shop_name, b.pincode, b.address ?? null, b.gst_no ?? null]);
+      // brought in by this distributor: connected straight away, and their first (pinned) supplier
+      await exec(c, "INSERT INTO retailer_distributor_relations (retailer_id, distributor_id, is_primary, status, requested_by) VALUES (?,?,1,'active','distributor')", [u.insertId, distributorId]);
+      return u.insertId as number;
+    });
+  } catch (e: any) {
+    if (e?.code === 'ER_DUP_ENTRY') throw new AppError(409, String(e.message).includes('uq_users_email') ? 'EMAIL_TAKEN' : 'PHONE_TAKEN', 'Phone or email already registered');
+    throw e;
+  }
+  await audit(actor, 'retailer.create', 'user', id, { phone: b.phone, distributor_id: distributorId, managed_by_id: managedBy });
+  res.status(201).json({ id, phone: b.phone, name: b.name, shop_name: b.shop_name, managed_by_id: managedBy });
+}));
+
 // Ask an existing retailer (by phone) to become a customer. Nothing is shared or posted until THEY accept.
 // The answer is identical whether or not the number belongs to a retailer, so phone numbers cannot be probed.
 distributorRouter.post('/retailers', requireRole('distributor'), asyncHandler(async (req, res) => {
@@ -171,10 +220,15 @@ distributorRouter.post('/retailers', requireRole('distributor'), asyncHandler(as
 }));
 
 distributorRouter.get('/retailers', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
+  const { mine } = z.object({ mine: z.enum(['0', '1']).default('0') }).parse(req.query);
+  const onlyMine = mine === '1' && req.auth!.role === 'employee';
   const rows = await q<any>(pool, `
-    SELECT u.id, u.name, u.phone, rp.shop_name, rp.pincode, rdr.is_primary, rdr.balance_due_paise, rdr.credit_limit_paise, rdr.credit_days
+    SELECT u.id, u.name, u.phone, rp.shop_name, rp.pincode, rdr.is_primary, rdr.balance_due_paise, rdr.credit_limit_paise, rdr.credit_days,
+      u.created_by, u.managed_by_id, mb.name managed_by_name
     FROM retailer_distributor_relations rdr JOIN users u ON u.id = rdr.retailer_id
-    JOIN retailer_profiles rp ON rp.user_id = u.id WHERE rdr.distributor_id = ? AND rdr.status = 'active' ORDER BY rp.shop_name`, [req.auth!.distributorId]);
+    JOIN retailer_profiles rp ON rp.user_id = u.id LEFT JOIN users mb ON mb.id = u.managed_by_id
+    WHERE rdr.distributor_id = ? AND rdr.status = 'active' ${onlyMine ? 'AND u.managed_by_id = ?' : ''} ORDER BY rp.shop_name`,
+    onlyMine ? [req.auth!.distributorId, req.auth!.userId] : [req.auth!.distributorId]);
   // Pending requests reveal only the phone number the distributor already typed.
   const pending = await q<any>(pool, `
     SELECT u.id, u.phone FROM retailer_distributor_relations rdr JOIN users u ON u.id = rdr.retailer_id

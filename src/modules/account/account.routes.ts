@@ -15,7 +15,7 @@ accountRouter.use(authenticate);
 // Who am I: used by the app to show email status and role.
 accountRouter.get('/', asyncHandler(async (req, res) => {
   const u = await q1<any>(pool, 'SELECT id, role, name, phone, email, email_verified_at, totp_enabled_at, created_at FROM users WHERE id = ?', [req.auth!.userId]);
-  res.json({ id: u.id, role: u.role, name: u.name, phone: u.phone, email: u.email, email_verified: !!u.email_verified_at, ...(u.role === 'admin' && { two_factor: !!u.totp_enabled_at }), created_at: u.created_at });
+  res.json({ id: u.id, role: u.role, name: u.name, phone: u.phone, email: u.email, email_verified: !!u.email_verified_at, ...((u.role === 'admin' || u.role === 'company_employee') && { two_factor: !!u.totp_enabled_at }), created_at: u.created_at });
 }));
 
 // Everything we hold about the signed-in user (privacy / data-portability request).
@@ -93,6 +93,16 @@ accountRouter.delete('/', asyncHandler(async (req, res) => {
   invalidateUser(a.userId);
   await audit(a.userId, 'account.delete', 'user', a.userId);
   res.status(204).end();
+}));
+
+// Recent sign-ins and failed attempts on this account, newest first, so odd activity is easy to spot.
+accountRouter.get('/login-history', asyncHandler(async (req, res) => {
+  const rows = await q<any>(pool, `SELECT id, action, meta, created_at FROM audit_log
+    WHERE actor_id = ? AND action IN ('auth.login','auth.login_failed','auth.login_locked','auth.totp_failed') ORDER BY id DESC LIMIT 30`, [req.auth!.userId]);
+  res.json({ entries: rows.map((r) => {
+    const m = r.meta ? JSON.parse(r.meta) : {};
+    return { id: r.id, ok: r.action === 'auth.login', event: r.action, at: r.created_at, ip: m.ip ?? null, device: m.device ?? null };
+  }) });
 }));
 
 // ---------- devices / sessions ----------
