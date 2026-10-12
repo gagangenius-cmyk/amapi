@@ -1,0 +1,70 @@
+# Production-like stack. Put real secrets in a .env file next to this one (never commit it).
+services:
+  db:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: aymee
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD (root password, used only for migrations)}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD (password of the limited account the API runs as)}
+    volumes:
+      - dbdata:/var/lib/mysql
+      - ./db-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${DB_PASSWORD}"]
+      interval: 5s
+      retries: 20
+  api:
+    image: ${API_IMAGE:-aayme-api:local}
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+    volumes:
+      - uploads:/app/uploads
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DB_HOST: db
+      # runtime: limited account (data only). migrations: root, used once at start-up.
+      DB_USER: aayme_app
+      DB_PASSWORD: ${APP_DB_PASSWORD}
+      MIGRATE_DB_USER: root
+      MIGRATE_DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: aymee
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET (32+ random chars)}
+      TRUST_PROXY: 1
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-0}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      REDIS_URL: ${REDIS_URL:-}   # set (e.g. redis://redis:6379) when running more than one api container
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      # online payments (optional): GATEWAY=razorpay plus the three keys
+      GATEWAY: ${GATEWAY:-}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
+      # GST e-invoice provider (optional)
+      EINVOICE_GSP_URL: ${EINVOICE_GSP_URL:-}
+      EINVOICE_GSP_TOKEN: ${EINVOICE_GSP_TOKEN:-}
+      # product photos: leave STORAGE empty for the uploads volume, or STORAGE=s3 for any S3-compatible bucket
+      STORAGE: ${STORAGE:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    ports: ["4000:4000"]
+  # Only needed to scale chat across several api containers:  docker compose --profile scale up -d
+  redis:
+    image: redis:7-alpine
+    profiles: ["scale"]
+    restart: unless-stopped
+volumes:
+  dbdata:
+  uploads:

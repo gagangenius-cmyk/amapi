@@ -1,0 +1,26 @@
+# Staging: the production stack, plus a mail catcher and a fake-money switch, on different ports so it can run beside production.
+#   docker compose -f docker-compose.yml -f docker-compose.staging.yml --env-file .env.staging up -d --build
+# Staging has its OWN database volume and its own secrets. Never point it at production data.
+services:
+  db:
+    environment:
+      MYSQL_DATABASE: aymee_staging
+    volumes:
+      - stagingdata:/var/lib/mysql
+      - ./db-init:/docker-entrypoint-initdb.d:ro
+  api:
+    environment:
+      DB_NAME: aymee_staging
+      ENABLE_DOCS: "1"               # Swagger UI on staging so testers can try the API
+      ADMIN_REQUIRE_2FA: "0"         # testers do not need an authenticator app
+      SMTP_HOST: mailpit             # every email (OTP codes!) lands in the mail catcher instead of a real inbox
+      SMTP_PORT: "1025"
+      SMTP_SECURE: "0"
+      SMTP_FROM: staging@aayme.test
+    ports: ["4100:4000"]
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports: ["8025:8025"]             # open http://localhost:8025 to read the emails
+volumes:
+  stagingdata:
