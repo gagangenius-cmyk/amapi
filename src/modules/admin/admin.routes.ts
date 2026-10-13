@@ -17,24 +17,32 @@ import { adminReportsRouter } from '../reports/admin.reports.routes';
 import { adminCatalogRouter } from '../catalog/admin.catalog.routes';
 import { adminCommissionRouter } from '../commission/commission.routes';
 import { cleanActions, cleanGrantable, effectivePermissions, parseStaffPermissions, STAFF_ACTIONS } from '../staff/permissions';
-import { assertIdentityFree, commissionReport, createDistributorAccount, distributorBody, dupToConflict, listDistributors } from '../staff/staff.service';
+import { assertIdentityFree, commissionReport, dupToConflict, listDistributors } from '../staff/staff.service';
+import { adminOnboardingRouter } from '../onboarding/onboarding.routes';
 
 export const adminRouter = Router();
 adminRouter.use(authenticate, requireRole('admin'), requireTwoFactor);
 adminRouter.use(adminReportsRouter);
 adminRouter.use(adminCatalogRouter);
 adminRouter.use(adminCommissionRouter);
+adminRouter.use(adminOnboardingRouter);
 
 adminRouter.get('/distributors', asyncHandler(async (_req, res) => {
   res.json({ permission_catalog: PERMISSION_CATALOG, distributors: await listDistributors('1=1', []) });
 }));
 
-// The admin opens a distributor account directly (all switches on unless told otherwise, subscription length is theirs to choose).
-adminRouter.post('/distributors', asyncHandler(async (req, res) => {
-  const b = distributorBody.parse(req.body);
-  const out = await createDistributorAccount(b, req.auth!.userId, null);
-  await audit(req.auth!.userId, 'admin.distributor_create', 'user', out.id, { phone: b.phone });
-  res.status(201).json({ id: out.id, phone: b.phone, business_name: b.business_name, permissions: out.permissions });
+// The admin does not open distributor accounts: a company employee onboards them, and the account appears once the subscription
+// fee has been received (see /onboarding). The admin watches, confirms UPI payments, and can hand a distributor to another employee.
+adminRouter.put('/distributors/:id/employee', asyncHandler(async (req, res) => {
+  const { employee_id } = z.object({ employee_id: z.number().int().positive() }).parse(req.body);
+  const id = idParam(req);
+  const d = await q1<any>(pool, "SELECT id, created_by FROM users WHERE id = ? AND role = 'distributor'", [id]);
+  if (!d) throw new AppError(404, 'NOT_FOUND', 'Distributor not found');
+  const e = await q1<any>(pool, "SELECT id, name FROM users WHERE id = ? AND role = 'company_employee' AND is_active = 1", [employee_id]);
+  if (!e) throw new AppError(400, 'NOT_AN_EMPLOYEE', 'Choose an active company employee');
+  await exec(pool, 'UPDATE users SET created_by = ? WHERE id = ?', [employee_id, id]);
+  await audit(req.auth!.userId, 'admin.distributor_reassign', 'user', id, { from: d.created_by, to: employee_id });
+  res.json({ id, employee_id, employee: e.name });
 }));
 
 // Orders placed with non-pinned distributors, for commission tracking.

@@ -10,6 +10,9 @@ import { fromPaise } from '../../utils/money';
 import { storefrontProducts } from '../catalog/catalog.routes';
 import { nearbyDistributors, storeAccess } from './access';
 import { DEFAULT_PERMISSIONS } from '../distributors/subscription';
+import { allowedCategoryIds, audienceClause, categoryClause } from '../catalog/scope';
+import { toCsv } from '../../utils/tabular';
+import { parseSocial } from '../distributors/social';
 
 export const retailerRouter = Router();
 retailerRouter.use(authenticate, requireRole('retailer'));
@@ -28,7 +31,7 @@ retailerRouter.get('/stores', asyncHandler(async (req, res) => {
   const pincode = z.string().regex(/^\d{6}$/).default(profile.pincode).parse(req.query.pincode);
 
   const linked = await q<any>(pool, `
-    SELECT dp.user_id id, dp.business_name, dp.city, dp.permissions, rdr.is_primary, rdr.requested_by, rdr.balance_due_paise, rdr.credit_limit_paise, rdr.credit_days
+    SELECT dp.user_id id, dp.business_name, dp.city, dp.permissions, dp.social_links, rdr.is_primary, rdr.requested_by, rdr.balance_due_paise, rdr.credit_limit_paise, rdr.credit_days
     FROM retailer_distributor_relations rdr JOIN distributor_profiles dp ON dp.user_id = rdr.distributor_id
     WHERE rdr.retailer_id = ? AND rdr.status = 'active' AND ${ACTIVE} ORDER BY rdr.is_primary DESC, rdr.id`, [retailerId]);
 
@@ -37,11 +40,12 @@ retailerRouter.get('/stores', asyncHandler(async (req, res) => {
     return {
       id: r.id, business_name: r.business_name, city: r.city ?? null, is_pinned: !!r.is_primary, balance_due_paise: Number(r.balance_due_paise),
       credit_limit: r.credit_limit_paise == null ? null : fromPaise(Number(r.credit_limit_paise)), credit_days: r.credit_days,
-      in_hierarchy: !!r.is_primary || r.requested_by === 'distributor', accepts_online_payment: !!perms.online_payments, chat_enabled: !!perms.chat_enabled,
+      in_hierarchy: !!r.is_primary || r.requested_by === 'distributor', accepts_online_payment: !!perms.online_payments, accepts_cod: !!perms.cod_enabled, chat_enabled: !!perms.chat_enabled,
+      social_links: parseSocial(r.social_links),
     };
   };
   const primaryRow = linked.find((r) => r.is_primary);
-  const primary = primaryRow ? { ...card(primaryRow), ...(await storefrontProducts(primaryRow.id, { limit: PREVIEW, retailerId })), product_count: await countProducts(primaryRow.id) } : null;
+  const primary = primaryRow ? { ...card(primaryRow), ...(await storefrontProducts(primaryRow.id, { limit: PREVIEW, retailerId })), product_count: await countProducts(primaryRow.id, retailerId) } : null;
   const others = linked.filter((r) => !r.is_primary).map(card);
   const nearby = (await nearbyDistributors(pool, retailerId, pincode)).map((o) => ({ id: o.id, business_name: o.business_name, city: o.city ?? null, is_pinned: false, linked: false, commission_applicable: true }));
 
@@ -56,14 +60,18 @@ retailerRouter.get('/stores', asyncHandler(async (req, res) => {
   });
 }));
 
-const countProducts = async (distributorId: number) => Number((await q1<any>(pool, "SELECT COUNT(*) n FROM products WHERE distributor_id = ? AND deleted_at IS NULL AND is_active = 1 AND review_status = 'approved'", [distributorId]))!.n);
+const countProducts = async (distributorId: number, retailerId: number) => {
+  const scope = categoryClause(await allowedCategoryIds(pool, retailerId, distributorId));
+  const own = audienceClause(retailerId);
+  return Number((await q1<any>(pool, `SELECT COUNT(*) n FROM products WHERE distributor_id = ? AND deleted_at IS NULL AND is_active = 1 AND review_status = 'approved'${scope.sql}${own.sql}`, [distributorId, ...scope.args, ...own.args]))!.n);
+};
 
 /** A store's profile page. Only for stores this retailer may see. */
 retailerRouter.get('/stores/:distributorId', asyncHandler(async (req, res) => {
   const id = idParam(req, 'distributorId');
   const access = await storeAccess(pool, req.auth!.userId, id);
   if (!access) throw notFound('Store');
-  const d = (await q1<any>(pool, 'SELECT user_id id, business_name, city, address, gst_no, permissions FROM distributor_profiles WHERE user_id = ?', [id]))!;
+  const d = (await q1<any>(pool, 'SELECT user_id id, business_name, city, address, gst_no, permissions, social_links FROM distributor_profiles WHERE user_id = ?', [id]))!;
   const rel = await q1<any>(pool, "SELECT is_primary, requested_by, balance_due_paise, credit_limit_paise, credit_days FROM retailer_distributor_relations WHERE retailer_id = ? AND distributor_id = ? AND status = 'active'", [req.auth!.userId, id]);
   const perms = { ...DEFAULT_PERMISSIONS, ...JSON.parse(d.permissions) };
   const offers = (await q1<any>(pool, "SELECT COUNT(*) n FROM announcements WHERE distributor_id = ? AND (valid_until IS NULL OR valid_until >= UTC_DATE()) AND created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL 30 DAY)", [id]))!.n;
@@ -72,8 +80,33 @@ retailerRouter.get('/stores/:distributorId', asyncHandler(async (req, res) => {
     access, is_pinned: !!rel?.is_primary, in_hierarchy: !!rel && (!!rel.is_primary || rel.requested_by === 'distributor'),
     commission_applicable: !(rel && (rel.is_primary || rel.requested_by === 'distributor')),
     balance_due_paise: rel ? Number(rel.balance_due_paise) : 0, credit_limit: rel?.credit_limit_paise == null ? null : fromPaise(Number(rel.credit_limit_paise)), credit_days: rel?.credit_days ?? 0,
-    product_count: await countProducts(id), offers: Number(offers), accepts_online_payment: !!perms.online_payments, chat_enabled: !!perms.chat_enabled && access === 'linked',
+    product_count: await countProducts(id, req.auth!.userId), offers: Number(offers), accepts_online_payment: !!perms.online_payments, accepts_cod: !!perms.cod_enabled, social_links: parseSocial(d.social_links), chat_enabled: !!perms.chat_enabled && access === 'linked',
   });
+}));
+
+/**
+ * The retailer's own price list as a spreadsheet: exactly the products they may see, at the prices THEY pay (standard, break,
+ * contract). It is built for the signed-in retailer from the same filters as the storefront, so it can never contain another
+ * retailer's products or prices, and is never cached.
+ */
+retailerRouter.get('/stores/:distributorId/price-list.csv', asyncHandler(async (req, res) => {
+  const id = idParam(req, 'distributorId');
+  if (!(await storeAccess(pool, req.auth!.userId, id))) throw notFound('Store');
+  const { products } = await storefrontProducts(id, { retailerId: req.auth!.userId, limit: 5000 });
+  const name = (await q1<any>(pool, 'SELECT business_name FROM distributor_profiles WHERE user_id = ?', [id]))!.business_name;
+  const rows = products.map((p: any) => ({
+    name: p.display_name ?? p.name, sku: p.sku ?? '', category: p.category ?? '', unit: p.unit, price: p.price, gst: p.gst_rate_bps / 100, moq: p.min_order_qty,
+    breaks: (p.tiers ?? []).map((t: any) => `${t.min_qty}+ at ${t.price}`).join('; '), available: p.available_qty ?? p.stock_qty, note: p.price_note ?? '',
+  }));
+  await audit(req.auth!.userId, 'retailer.price_download', 'user', id, { products: rows.length });
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="price-list-${String(name).replace(/[^\w]+/g, '-').slice(0, 40)}.csv"`);
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.send(toCsv([
+    { key: 'name', header: 'Product' }, { key: 'sku', header: 'SKU' }, { key: 'category', header: 'Category' }, { key: 'unit', header: 'Unit' },
+    { key: 'price', header: 'Your price (INR, excl. GST)', type: 'number' }, { key: 'gst', header: 'GST %', type: 'number' }, { key: 'moq', header: 'Minimum order', type: 'number' },
+    { key: 'breaks', header: 'Quantity prices' }, { key: 'available', header: 'Available', type: 'number' }, { key: 'note', header: 'Note' },
+  ], rows));
 }));
 
 // Distributors this retailer has an account with, plus running balance (for the Khata tab).

@@ -9,11 +9,13 @@ export interface Permissions {
   pincode_selling: boolean;
   online_payments: boolean;
   employees_enabled: boolean;
+  cod_enabled: boolean;
   [k: string]: boolean;
 }
 
 export const DEFAULT_PERMISSIONS: Permissions = {
   self_delivery: true, khatabook_enabled: true, chat_enabled: true, notifications_enabled: true, pincode_selling: true, online_payments: true, employees_enabled: true,
+  cod_enabled: false,   // cash on delivery is switched on per distributor, never by default
 };
 
 /** What each switch does, in plain words (shown to the admin). */
@@ -25,6 +27,7 @@ export const PERMISSION_CATALOG: { key: keyof typeof DEFAULT_PERMISSIONS; label:
   { key: 'pincode_selling', label: 'Sell by pincode', help: 'Retailers in the chosen pincodes can see the store without being connected' },
   { key: 'online_payments', label: 'Online payments', help: 'UPI and card payments from retailers' },
   { key: 'employees_enabled', label: 'Team members', help: 'Add employees under this distributor' },
+  { key: 'cod_enabled', label: 'Cash on delivery', help: 'Retailers may choose to pay in cash when the order is delivered' },
 ];
 
 export async function loadDistributor(c: Conn, distributorId: number) {

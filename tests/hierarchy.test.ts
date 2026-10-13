@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { migrate } from '../scripts/migrate';
 import { createApp } from '../src/app';
 import { exec, pool } from '../src/db/pool';
+import { onboardDistributor, startOnboarding } from './helpers/onboard';
 
 const app = createApp();
 let n = 0;
@@ -56,51 +57,46 @@ describe('1. admin creates company employees and decides what they may do', () =
     const a = await admin();
     const s = (await request(app).post('/api/v1/admin/staff').set(auth(a)).send(staffBody()).expect(201)).body;
     const tok = await login(s.phone);
-    await request(app).post('/api/v1/staff/distributors').set(auth(tok)).send(distBody()).expect(201);
+    expect((await startOnboarding(app, { token: a }, { token: tok })).res.status).toBe(201);
     await request(app).put(`/api/v1/admin/staff/${s.id}`).set(auth(a)).send({ actions: [] }).expect(200);
-    expect((await request(app).post('/api/v1/staff/distributors').set(auth(tok)).send(distBody())).status).toBe(403);
+    expect((await startOnboarding(app, { token: a }, { token: tok })).res.status).toBe(403);
     await request(app).put(`/api/v1/admin/staff/${s.id}`).set(auth(a)).send({ is_active: false }).expect(200);
     expect((await request(app).get('/api/v1/staff/me').set(auth(tok))).status).toBe(401);
   });
 });
 
-describe('2. a company employee creates distributors, handing out only the switches the admin gave them', () => {
-  it('creates a distributor who can sign in; ungranted switches start off', async () => {
+describe('2. a company employee onboards distributors, handing out only the switches the admin gave them', () => {
+  it('onboards a distributor who can sign in once the fee is confirmed; ungranted switches start off', async () => {
     const a = await admin();
     const s = (await request(app).post('/api/v1/admin/staff').set(auth(a)).send(staffBody()).expect(201)).body;
     const tok = await login(s.phone);
-    const body = distBody({ permissions: { chat_enabled: false } });
-    const d = (await request(app).post('/api/v1/staff/distributors').set(auth(tok)).send(body).expect(201)).body;
-    expect(d.permissions).toMatchObject({ chat_enabled: false, khatabook_enabled: true, self_delivery: false, employees_enabled: false, online_payments: false });
-    const dTok = await login(body.phone);
-    const prof = (await request(app).get('/api/v1/distributor/me').set(auth(dTok)).expect(200)).body;
-    expect(prof.business_name).toBe(body.business_name);
-    expect(prof.permissions.employees_enabled).toBe(false);
+    const d = await onboardDistributor(app, { token: a }, { token: tok }, { permissions: { chat_enabled: false } });
+    const prof = (await request(app).get('/api/v1/distributor/me').set(auth(d.token)).expect(200)).body;
+    expect(prof.permissions).toMatchObject({ chat_enabled: false, khatabook_enabled: true, self_delivery: false, employees_enabled: false, online_payments: false, cod_enabled: false });
   });
 
   it('refuses a switch the employee does not hold', async () => {
     const a = await admin();
     const s = (await request(app).post('/api/v1/admin/staff').set(auth(a)).send(staffBody()).expect(201)).body;
     const tok = await login(s.phone);
-    const r = await request(app).post('/api/v1/staff/distributors').set(auth(tok)).send(distBody({ permissions: { online_payments: true } }));
-    expect(r.status).toBe(403);
-    expect((await request(app).post('/api/v1/staff/distributors').set(auth(tok)).send(distBody({ permissions: { nonsense: true } }))).status).toBe(400);
+    expect((await startOnboarding(app, { token: a }, { token: tok }, { permissions: { online_payments: true } })).res.status).toBe(403);
+    expect((await startOnboarding(app, { token: a }, { token: tok }, { permissions: { nonsense: true } })).res.status).toBe(400);
   });
 
   it('needs the create_distributors power', async () => {
     const a = await admin();
     const s = (await request(app).post('/api/v1/admin/staff').set(auth(a)).send(staffBody({ actions: ['view_commissions'] })).expect(201)).body;
     const tok = await login(s.phone);
-    expect((await request(app).post('/api/v1/staff/distributors').set(auth(tok)).send(distBody())).status).toBe(403);
+    expect((await startOnboarding(app, { token: a }, { token: tok })).res.status).toBe(403);
     await request(app).get('/api/v1/staff/commissions').set(auth(tok)).expect(200);
   });
 
-  it('updates only distributors they created, and only within what they may grant', async () => {
+  it('updates only distributors mapped to them, and only within what they may grant', async () => {
     const a = await admin();
     const s1 = (await request(app).post('/api/v1/admin/staff').set(auth(a)).send(staffBody()).expect(201)).body;
     const s2 = (await request(app).post('/api/v1/admin/staff').set(auth(a)).send(staffBody()).expect(201)).body;
     const t1 = await login(s1.phone); const t2 = await login(s2.phone);
-    const d = (await request(app).post('/api/v1/staff/distributors').set(auth(t1)).send(distBody()).expect(201)).body;
+    const d = await onboardDistributor(app, { token: a }, { token: t1 });
 
     const upd = (await request(app).put(`/api/v1/staff/distributors/${d.id}`).set(auth(t1)).send({ permissions: { chat_enabled: false }, extend_days: 10 }).expect(200)).body;
     expect(upd.permissions.chat_enabled).toBe(false);
@@ -121,19 +117,25 @@ describe('2. a company employee creates distributors, handing out only the switc
     const tok = await login(s.phone);
     for (const url of ['/api/v1/admin/distributors', '/api/v1/distributor/employees', '/api/v1/retailer/stores']) expect((await request(app).get(url).set(auth(tok))).status).toBe(403);
   });
+
+  it('the admin can no longer open a distributor account directly', async () => {
+    const a = await admin();
+    expect((await request(app).post('/api/v1/admin/distributors').set(auth(a)).send(distBody())).status).toBe(404);
+  });
 });
 
 describe('3. a distributor creates employees and retailers, and may place a retailer under an employee', () => {
   async function distributor() {
     const a = await admin();
-    const d = (await request(app).post('/api/v1/admin/distributors').set(auth(a)).send(distBody()).expect(201)).body;
-    return { token: await login(d.phone), id: d.id as number };
+    const s = (await request(app).post('/api/v1/admin/staff').set(auth(a)).send(staffBody({ grantable: ['employees_enabled'] })).expect(201)).body;
+    const d = await onboardDistributor(app, { token: a }, { token: await login(s.phone) }, { permissions: { employees_enabled: true } });
+    return { token: d.token, id: d.id, categoryId: d.category!.id };
   }
   const retailerBody = (over: object = {}) => ({ phone: phone(), name: 'Shop Keeper', password: 'password123', shop_name: 'Shop ' + n, pincode: '400001', address: '1 Main Road', ...over });
 
   it('creates a retailer who can sign in and is linked as a supplier at once', async () => {
     const d = await distributor();
-    const body = retailerBody();
+    const body = retailerBody({ category_ids: [d.categoryId] });
     const r = (await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(d.token)).send(body).expect(201)).body;
     expect(r).toMatchObject({ shop_name: body.shop_name, managed_by_id: null });
 
@@ -150,40 +152,41 @@ describe('3. a distributor creates employees and retailers, and may place a reta
     const e = (await request(app).post('/api/v1/distributor/employees').set(auth(d.token)).send({ phone: ep, name: 'Field Rep', password: 'password123' }).expect(201)).body;
     const oe = (await request(app).post('/api/v1/distributor/employees').set(auth(other.token)).send({ phone: phone(), name: 'Other Rep', password: 'password123' }).expect(201)).body;
 
-    const r = (await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(d.token)).send(retailerBody({ managed_by_id: e.id })).expect(201)).body;
+    const r = (await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(d.token)).send(retailerBody({ managed_by_id: e.id, category_ids: [d.categoryId] })).expect(201)).body;
     expect(r.managed_by_id).toBe(e.id);
-    expect((await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(d.token)).send(retailerBody({ managed_by_id: oe.id }))).status).toBe(400);
+    expect((await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(d.token)).send(retailerBody({ managed_by_id: oe.id, category_ids: [d.categoryId] }))).status).toBe(400);
 
     const team = (await request(app).get('/api/v1/distributor/employees').set(auth(d.token)).expect(200)).body.employees;
     expect(team.find((x: any) => x.id === e.id).retailers).toBe(1);
   });
 
   it('refuses a phone that is already registered', async () => {
-    const d = await distributor(); const body = retailerBody();
+    const d = await distributor(); const body = retailerBody({ category_ids: [d.categoryId] });
     await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(d.token)).send(body).expect(201);
     expect((await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(d.token)).send(body)).status).toBe(409);
   });
 
   it('a retailer or a company employee cannot create retailer accounts', async () => {
     const d = await distributor();
-    const body = retailerBody();
+    const body = retailerBody({ category_ids: [d.categoryId] });
     await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(d.token)).send(body).expect(201);
     const rTok = await login(body.phone);
-    expect((await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(rTok)).send(retailerBody())).status).toBe(403);
+    expect((await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(rTok)).send(retailerBody({ category_ids: [d.categoryId] }))).status).toBe(403);
   });
 });
 
 describe('4. a distributor employee creates retailers under their own tree', () => {
   it('creates a retailer that sits under that employee, and the "mine" list shows only theirs', async () => {
     const a = await admin();
-    const d = (await request(app).post('/api/v1/admin/distributors').set(auth(a)).send(distBody()).expect(201)).body;
-    const dTok = await login(d.phone);
+    const s0 = (await request(app).post('/api/v1/admin/staff').set(auth(a)).send(staffBody({ grantable: ['employees_enabled'] })).expect(201)).body;
+    const d = await onboardDistributor(app, { token: a }, { token: await login(s0.phone) }, { permissions: { employees_enabled: true } });
+    const dTok = d.token;
     const ep1 = phone(); const ep2 = phone();
     const e1 = (await request(app).post('/api/v1/distributor/employees').set(auth(dTok)).send({ phone: ep1, name: 'Rep One', password: 'password123' }).expect(201)).body;
     await request(app).post('/api/v1/distributor/employees').set(auth(dTok)).send({ phone: ep2, name: 'Rep Two', password: 'password123' }).expect(201);
     const t1 = await login(ep1); const t2 = await login(ep2);
 
-    const body = { phone: phone(), name: 'Kirana Owner', password: 'password123', shop_name: 'Kirana', pincode: '400002' };
+    const body = { phone: phone(), name: 'Kirana Owner', password: 'password123', shop_name: 'Kirana', pincode: '400002', category_ids: [d.category!.id] };
     const r = (await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(t1)).send({ ...body, managed_by_id: 999999 }).expect(201)).body;
     expect(r.managed_by_id).toBe(e1.id);   // the employee cannot choose someone else; it is always their own tree
 
@@ -198,13 +201,14 @@ describe('4. a distributor employee creates retailers under their own tree', () 
 
   it('an expired subscription stops employees from creating retailers', async () => {
     const a = await admin();
-    const d = (await request(app).post('/api/v1/admin/distributors').set(auth(a)).send(distBody()).expect(201)).body;
-    const dTok = await login(d.phone);
+    const s0 = (await request(app).post('/api/v1/admin/staff').set(auth(a)).send(staffBody({ grantable: ['employees_enabled'] })).expect(201)).body;
+    const d = await onboardDistributor(app, { token: a }, { token: await login(s0.phone) }, { permissions: { employees_enabled: true } });
+    const dTok = d.token;
     const ep = phone();
     await request(app).post('/api/v1/distributor/employees').set(auth(dTok)).send({ phone: ep, name: 'Rep', password: 'password123' }).expect(201);
     await exec(pool, 'UPDATE distributor_profiles SET subscription_ends_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 DAY) WHERE user_id = ?', [d.id]);
     const t = await login(ep);
-    const r = await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(t)).send({ phone: phone(), name: 'Late Shop', password: 'password123', shop_name: 'Late', pincode: '400003' });
+    const r = await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(t)).send({ phone: phone(), name: 'Late Shop', password: 'password123', shop_name: 'Late', pincode: '400003', category_ids: [d.category!.id] });
     expect(r.status).toBe(402);
   });
 });

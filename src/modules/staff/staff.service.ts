@@ -8,18 +8,6 @@ import { GRANTABLE_KEYS } from './permissions';
 const phone = z.string().regex(/^\d{10}$/, '10-digit phone');
 const gstin = z.string().trim().toUpperCase().regex(/^\d{2}[A-Z0-9]{13}$/, 'GSTIN must be 15 characters');
 
-export const distributorBody = z.object({
-  phone, name: z.string().trim().min(2).max(120), password: z.string().min(8).max(100),
-  email: z.string().trim().toLowerCase().email().max(190).optional(),
-  business_name: z.string().trim().min(2).max(190), gst_no: gstin.optional(),
-  address: z.string().trim().min(3).max(255).optional(), city: z.string().trim().min(2).max(100).optional(),
-  pincode: z.string().regex(/^\d{6}$/, 'Pincode is 6 digits').optional(),
-  permissions: z.record(z.string(), z.boolean()).optional(),
-  subscription_days: z.number().int().min(1).max(365).optional(),
-});
-
-export const TRIAL_DAYS = 30;
-
 /** Turn a "phone/email already used" database error into the clean 409 the app shows. */
 export function dupToConflict(e: any): never {
   if (e?.code === 'ER_DUP_ENTRY') {
@@ -51,24 +39,9 @@ export function resolvePermissions(requested: Record<string, boolean> | undefine
     const denied = wanted.filter(([k]) => !allowed.includes(k)).map(([k]) => k);
     if (denied.length) throw forbidden(`You cannot grant: ${denied.join(', ')}`);
   }
-  const start = base ?? (allowed ? Object.fromEntries(GRANTABLE_KEYS.map((k) => [k, allowed.includes(k)])) : { ...DEFAULT_PERMISSIONS });
+  // Everything the person may grant starts on, except cash on delivery: that carries financial risk, so it is on only when asked for.
+  const start = base ?? (allowed ? Object.fromEntries(GRANTABLE_KEYS.map((k) => [k, allowed.includes(k) && k !== 'cod_enabled'])) : { ...DEFAULT_PERMISSIONS });
   return { ...start, ...Object.fromEntries(wanted) };
-}
-
-export async function createDistributorAccount(b: z.infer<typeof distributorBody>, createdBy: number, allowed: string[] | null) {
-  const permissions = resolvePermissions(b.permissions, allowed, null);
-  const hash = await bcrypt.hash(b.password, 10);
-  // only the admin chooses the subscription length; everyone else opens the standard trial
-  const days = allowed ? TRIAL_DAYS : b.subscription_days ?? TRIAL_DAYS;
-  try {
-    return await withTx(async (c) => {
-      await assertIdentityFree(c, b.phone, b.email);
-      const u = await exec(c, "INSERT INTO users (role, phone, email, name, password_hash, created_by) VALUES ('distributor',?,?,?,?,?)", [b.phone, b.email ?? null, b.name, hash, createdBy]);
-      await exec(c, `INSERT INTO distributor_profiles (user_id, business_name, gst_no, address, city, pincode, permissions, subscription_ends_at)
-        VALUES (?,?,?,?,?,?,?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? DAY))`, [u.insertId, b.business_name, b.gst_no ?? null, b.address ?? null, b.city ?? null, b.pincode ?? null, JSON.stringify(permissions), days]);
-      return { id: u.insertId as number, permissions };
-    });
-  } catch (e) { return dupToConflict(e); }
 }
 
 /** One row per distributor, shaped the same for the admin console and the company employee's app. */

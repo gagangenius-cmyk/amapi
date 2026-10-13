@@ -13,6 +13,7 @@ import { reservedByProduct } from '../inventory/inventory.service';
 import { displayName } from '../catalog/catalog.routes';
 import { changeStock, loadTiers } from '../catalog/stock';
 import { loadRules, resolvePrice } from '../pricing/resolver';
+import { allowedCategoryIds, audienceClause, categoryClause } from '../catalog/scope';
 import { earnCommission, snapshotFor } from '../commission/commission.service';
 import { postLedger } from '../ledger/ledger.service';
 import { storeAccess } from '../retailers/access';
@@ -32,7 +33,7 @@ const TRANSITIONS: Record<Status, Partial<Record<Status, Array<'retailer' | 'dis
 };
 
 const present = (o: any, items?: any[]) => ({
-  id: o.id, retailer_id: o.retailer_id, distributor_id: o.distributor_id, status: o.status, total: fromPaise(Number(o.total_paise)),
+  id: o.id, retailer_id: o.retailer_id, distributor_id: o.distributor_id, status: o.status, total: fromPaise(Number(o.total_paise)), payment_method: o.payment_method ?? 'credit',
   is_out_of_hierarchy: !!o.is_out_of_hierarchy, commission_rate_bps: o.commission_rate_bps, assigned_employee_id: o.assigned_employee_id,
   created_at: o.created_at, invoice_no: o.invoice_no ?? null, is_adjusted: !!o.is_adjusted,
   ...(o.retailer_name !== undefined && { retailer_name: o.retailer_name, distributor_name: o.distributor_name, item_count: Number(o.item_count) }),
@@ -44,11 +45,13 @@ orderRouter.post('/', requireRole('retailer'), asyncHandler(async (req, res) => 
   const b = z.object({
     distributor_id: z.number().int().positive(),
     items: z.array(z.object({ product_id: z.number().int().positive(), qty: z.number().int().min(1).max(100000) })).min(1).max(100),
+    // credit = on the khata account (as always); cod = the retailer pays cash to the delivery person when the order arrives
+    payment_method: z.enum(['credit', 'cod']).default('credit'),
   }).parse(req.body);
   const key = idempotencyKey(req);
   const retailerId = req.auth!.userId;
   // Fingerprint of what was asked for, so reusing a key for a DIFFERENT cart is rejected instead of silently returning the old order.
-  const fingerprint = crypto.createHash('sha256').update(JSON.stringify({ d: b.distributor_id, i: [...b.items].sort((x, y) => x.product_id - y.product_id) })).digest('hex');
+  const fingerprint = crypto.createHash('sha256').update(JSON.stringify({ d: b.distributor_id, pm: b.payment_method, i: [...b.items].sort((x, y) => x.product_id - y.product_id) })).digest('hex');
   const replay = (existing: any) => {
     if (existing.request_hash && existing.request_hash !== fingerprint)
       throw new AppError(422, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key was already used with a different order');
@@ -60,9 +63,13 @@ orderRouter.post('/', requireRole('retailer'), asyncHandler(async (req, res) => 
     if (dup) return replay(dup);
 
     const dist = await assertSubscriptionActive(c, b.distributor_id);
+    if (b.payment_method === 'cod' && !dist.permissions.cod_enabled) throw new AppError(403, 'COD_NOT_AVAILABLE', 'This distributor does not offer cash on delivery');
     const ids = [...new Set(b.items.map((i) => i.product_id))];
     if (ids.length !== b.items.length) throw new AppError(400, 'DUPLICATE_ITEM', 'Each product may appear once');
-    const products = await q<any>(c, "SELECT * FROM products WHERE id IN (?) AND distributor_id = ? AND deleted_at IS NULL AND is_active = 1 AND review_status = 'approved' ORDER BY id FOR UPDATE", [ids, b.distributor_id]);   // locked: parallel orders for the same product queue up here
+    // a retailer given categories can only buy products of those categories; everything else is "unavailable" to them
+    const scope = categoryClause(await allowedCategoryIds(c, retailerId, b.distributor_id));
+    const own = audienceClause(retailerId);          // a product kept for other retailers is unavailable to this one
+    const products = await q<any>(c, `SELECT * FROM products WHERE id IN (?) AND distributor_id = ? AND deleted_at IS NULL AND is_active = 1 AND review_status = 'approved'${scope.sql}${own.sql} ORDER BY id FOR UPDATE`, [ids, b.distributor_id, ...scope.args, ...own.args]);   // locked: parallel orders for the same product queue up here
     if (products.length !== ids.length) throw new AppError(400, 'BAD_PRODUCT', 'Unknown or unavailable product');
     const byId = new Map(products.map((p) => [p.id, p]));
     // Stock already promised to orders waiting for acceptance is not available to this one (read under the lock above).
@@ -89,8 +96,8 @@ orderRouter.post('/', requireRole('retailer'), asyncHandler(async (req, res) => 
     // The link between them (locked, so parallel orders can not both slip under a credit limit).
     const rel = await q1<any>(c, 'SELECT id, status, balance_due_paise, credit_limit_paise FROM retailer_distributor_relations WHERE retailer_id = ? AND distributor_id = ? FOR UPDATE', [retailerId, b.distributor_id]);
     // Credit control: what they already owe + orders still waiting for acceptance + this order must fit the limit.
-    if (rel?.status === 'active' && rel.credit_limit_paise != null) {
-      const pending = Number((await q1<any>(c, "SELECT COALESCE(SUM(total_paise),0) t FROM orders WHERE retailer_id = ? AND distributor_id = ? AND status = 'placed' FOR UPDATE", [retailerId, b.distributor_id]))!.t); // locking read: sees orders committed while we waited for the lock
+    if (b.payment_method === 'credit' && rel?.status === 'active' && rel.credit_limit_paise != null) {
+      const pending = Number((await q1<any>(c, "SELECT COALESCE(SUM(total_paise),0) t FROM orders WHERE retailer_id = ? AND distributor_id = ? AND status = 'placed' AND payment_method = 'credit' FOR UPDATE", [retailerId, b.distributor_id]))!.t); // locking read: sees orders committed while we waited for the lock
       const exposure = Number(rel.balance_due_paise) + pending + total;
       if (exposure > Number(rel.credit_limit_paise))
         throw new AppError(409, 'CREDIT_LIMIT_EXCEEDED', `This order would take you over the credit limit of ₹${fromPaise(Number(rel.credit_limit_paise))} set by the distributor. Pay some dues or order less.`, {
@@ -115,8 +122,8 @@ orderRouter.post('/', requireRole('retailer'), asyncHandler(async (req, res) => 
 
     // Outside the hierarchy the order carries commission: fix the rule for each line now, so a later rule change cannot touch it.
     const commission = outOfHierarchy ? await snapshotFor(c, b.distributor_id, dist.commission_rate_bps, lines.map((l) => ({ id: l.p.id, category_id: l.p.category_id ?? null }))) : null;
-    const o = await exec(c, 'INSERT INTO orders (retailer_id, distributor_id, total_paise, is_out_of_hierarchy, commission_rate_bps, idempotency_key, request_hash) VALUES (?,?,?,?,?,?,?)', [
-      retailerId, b.distributor_id, total, outOfHierarchy ? 1 : 0, outOfHierarchy ? dist.commission_rate_bps : 0, key, fingerprint,
+    const o = await exec(c, 'INSERT INTO orders (retailer_id, distributor_id, total_paise, is_out_of_hierarchy, commission_rate_bps, idempotency_key, request_hash, payment_method) VALUES (?,?,?,?,?,?,?,?)', [
+      retailerId, b.distributor_id, total, outOfHierarchy ? 1 : 0, outOfHierarchy ? dist.commission_rate_bps : 0, key, fingerprint, b.payment_method,
     ]);
     await exec(c, 'INSERT INTO order_items (order_id, product_id, name, qty, unit_price_paise, gst_rate_bps, line_total_paise, standard_unit_price_paise, price_list_id, price_list_name, price_basis, commission_mode, commission_value, commission_rule_id) VALUES ?', [
       lines.map((l) => { const cm = commission?.get(l.p.id); return [o.insertId, l.p.id, displayName(l.p).slice(0, 190), l.qty, l.unit, l.p.gst_rate_bps, l.line, l.priced.standard_paise, l.priced.list_id, l.priced.list_name, l.priced.basis, cm?.mode ?? null, cm?.value ?? null, cm?.rule_id ?? null]; }),

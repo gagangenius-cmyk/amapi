@@ -6,7 +6,7 @@ import { Row, toCsv, toXlsx } from '../../utils/tabular';
 import { Range, parseRange } from './analytics';
 import { MAX_REPORT_ROWS, reportByType } from './catalogue';
 
-export interface JobParams { from?: string; to?: string; distributor_id?: number }
+export interface JobParams { from?: string; to?: string; distributor_ids?: number[]; distributor_id?: number }
 
 export const MIME = {
   csv: 'text/csv; charset=utf-8',
@@ -31,7 +31,7 @@ export async function runReportJob(id: number): Promise<'done' | 'failed' | 'ski
     if (!def) throw new Error(`Unknown report type ${job.type}`);
     const p: JobParams = JSON.parse(job.params);
     const range: Range = parseRange({ from: p.from, to: p.to });
-    let rows: Row[] = await def.rows(range, p.distributor_id);
+    let rows: Row[] = await def.rows(range, p.distributor_ids ?? (p.distributor_id ? [p.distributor_id] : undefined));
     const truncated = rows.length > MAX_REPORT_ROWS;
     if (truncated) rows = rows.slice(0, MAX_REPORT_ROWS);
 

@@ -6,6 +6,7 @@ import { createApp } from '../src/app';
 import { env } from '../src/config/env';
 import { exec, pool } from '../src/db/pool';
 import * as totp from '../src/utils/totp';
+import { startOnboarding } from './helpers/onboard';
 
 const app = createApp();
 let n = 0;
@@ -21,7 +22,7 @@ async function admin() {
 const staff = async (a: string, over: object = {}) =>
   (await request(app).post('/api/v1/admin/staff').set(auth(a)).send({ phone: phone(), name: 'Emp', password: 'password123', ...over }).expect(201)).body;
 const login = async (p: string) => (await request(app).post('/api/v1/auth/login').send({ phone: p, password: 'password123' }).expect(200)).body.access_token as string;
-const newDistributor = (t: string) => request(app).post('/api/v1/staff/distributors').set(auth(t)).send({ phone: phone(), name: 'Owner', password: 'password123', business_name: 'Biz ' + n });
+const newDistributor = async (t: string, a: string) => (await startOnboarding(app, { token: a }, { token: t })).res;
 
 beforeAll(async () => { await migrate(true); });
 afterAll(async () => { await pool.end(); });
@@ -52,12 +53,12 @@ describe('named roles', () => {
     const s = await staff(a, { role_id: role.id });
     expect(s).toMatchObject({ role_id: role.id, role_name: 'Starter', actions: [] });
     const t = await login(s.phone);
-    expect((await newDistributor(t)).status).toBe(403);
+    expect((await newDistributor(t, a)).status).toBe(403);
 
     await request(app).put(`/api/v1/admin/roles/${role.id}`).set(auth(a)).send({ actions: ['create_distributors'], grantable: ['chat_enabled'] }).expect(200);
     const me = (await request(app).get('/api/v1/staff/me').set(auth(t)).expect(200)).body;
     expect(me.actions).toEqual(['create_distributors']);
-    expect((await newDistributor(t)).status).toBe(201);
+    expect((await newDistributor(t, a)).status).toBe(201);
     const roleNow = (await request(app).get('/api/v1/admin/roles').set(auth(a))).body.roles.find((r: any) => r.id === role.id);
     expect(roleNow.members).toBe(1);
   });

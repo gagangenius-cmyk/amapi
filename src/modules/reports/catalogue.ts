@@ -9,7 +9,7 @@ export const MAX_REPORT_ROWS = 100_000;
 export interface ReportDef {
   type: string; title: string; description: string; usesRange: boolean;
   columns: Column[];
-  rows(r: Range, distributorId?: number): Promise<Row[]>;
+  rows(r: Range, distributorIds?: number[]): Promise<Row[]>;
 }
 
 const money = (v: unknown) => fromPaise(Math.round(Number(v ?? 0)));
@@ -34,7 +34,7 @@ export const REPORTS: ReportDef[] = [
           o.is_out_of_hierarchy, o.invoice_no
         FROM orders o JOIN distributor_profiles dp ON dp.user_id = o.distributor_id JOIN retailer_profiles rp ON rp.user_id = o.retailer_id
         LEFT JOIN ${DELIVERED} e ON e.order_id = o.id
-        WHERE o.created_at BETWEEN ? AND ?${d ? ' AND o.distributor_id = ?' : ''} ORDER BY o.id LIMIT ${LIMIT}`, d ? [r.from, r.to, d] : [r.from, r.to]);
+        WHERE o.created_at BETWEEN ? AND ?${d ? ' AND o.distributor_id IN (?)' : ''} ORDER BY o.id LIMIT ${LIMIT}`, d ? [r.from, r.to, d] : [r.from, r.to]);
       return rows.map((o) => ({ id: o.id, created_at: ts(o.created_at), delivered_at: ts(o.delivered_at), distributor: o.distributor, retailer: o.retailer, pincode: o.pincode,
         status: o.status, total: money(o.total_paise), tax: money(o.tax), outside: o.is_out_of_hierarchy ? 'yes' : 'no', invoice_no: o.invoice_no ?? '' }));
     },
@@ -48,7 +48,7 @@ export const REPORTS: ReportDef[] = [
     ],
     async rows(_r, d) {
       const rows = await q<any>(pool, `SELECT dp.business_name distributor, p.name, p.sku, p.category, p.brand, p.price_paise, p.gst_rate_bps, p.stock_qty, p.low_stock_threshold, p.is_active
-        FROM products p JOIN distributor_profiles dp ON dp.user_id = p.distributor_id WHERE p.deleted_at IS NULL${d ? ' AND p.distributor_id = ?' : ''}
+        FROM products p JOIN distributor_profiles dp ON dp.user_id = p.distributor_id WHERE p.deleted_at IS NULL${d ? ' AND p.distributor_id IN (?)' : ''}
         ORDER BY dp.business_name, p.name LIMIT ${LIMIT}`, d ? [d] : []);
       return rows.map((p) => ({ distributor: p.distributor, name: p.name, sku: p.sku ?? '', category: p.category ?? '', brand: p.brand ?? '', price: money(p.price_paise),
         gst: p.gst_rate_bps / 100, stock: p.stock_qty, threshold: p.low_stock_threshold, low: p.stock_qty <= p.low_stock_threshold ? 'yes' : 'no', active: p.is_active ? 'yes' : 'no' }));
@@ -63,7 +63,7 @@ export const REPORTS: ReportDef[] = [
     async rows(r, d) {
       const rows = await q<any>(pool, `SELECT sm.created_at, dp.business_name distributor, p.name product, sm.delta, sm.balance_after, sm.reason, sm.ref_order_id, sm.note
         FROM stock_movements sm JOIN products p ON p.id = sm.product_id JOIN distributor_profiles dp ON dp.user_id = sm.distributor_id
-        WHERE sm.created_at BETWEEN ? AND ?${d ? ' AND sm.distributor_id = ?' : ''} ORDER BY sm.id LIMIT ${LIMIT}`, d ? [r.from, r.to, d] : [r.from, r.to]);
+        WHERE sm.created_at BETWEEN ? AND ?${d ? ' AND sm.distributor_id IN (?)' : ''} ORDER BY sm.id LIMIT ${LIMIT}`, d ? [r.from, r.to, d] : [r.from, r.to]);
       return rows.map((m) => ({ at: ts(m.created_at), distributor: m.distributor, product: m.product, delta: m.delta, balance: m.balance_after, reason: m.reason, order: m.ref_order_id ?? '', note: m.note ?? '' }));
     },
   },
@@ -81,7 +81,7 @@ export const REPORTS: ReportDef[] = [
           (SELECT COUNT(*) FROM orders o WHERE o.distributor_id = dp.user_id AND o.created_at BETWEEN ? AND ?) orders,
           (SELECT COALESCE(SUM(o.total_paise),0) FROM orders o WHERE o.distributor_id = dp.user_id AND o.created_at BETWEEN ? AND ? AND o.status NOT IN ('rejected','cancelled')) gmv
         FROM distributor_profiles dp JOIN users u ON u.id = dp.user_id LEFT JOIN users cb ON cb.id = u.created_by
-        ${d ? 'WHERE dp.user_id = ?' : ''} ORDER BY dp.business_name LIMIT ${LIMIT}`, d ? [r.from, r.to, r.from, r.to, d] : [r.from, r.to, r.from, r.to]);
+        ${d ? 'WHERE dp.user_id IN (?)' : ''} ORDER BY dp.business_name LIMIT ${LIMIT}`, d ? [r.from, r.to, r.from, r.to, d] : [r.from, r.to, r.from, r.to]);
       return rows.map((x) => ({ business: x.business_name, owner: x.owner, phone: x.phone, city: x.city ?? '', active: x.is_active ? 'yes' : 'no', sub_end: ts(x.subscription_ends_at),
         retailers: Number(x.retailers), orders: Number(x.orders), gmv: money(x.gmv), created_by: x.created_by ?? '' }));
     },
@@ -95,11 +95,11 @@ export const REPORTS: ReportDef[] = [
     async rows(r, d) {
       const rows = await q<any>(pool, `
         SELECT rp.shop_name, u.name owner, u.phone, rp.pincode, u.created_at,
-          (SELECT COUNT(*) FROM orders o WHERE o.retailer_id = u.id AND o.created_at BETWEEN ? AND ?${d ? ' AND o.distributor_id = ?' : ''}) orders,
-          (SELECT COALESCE(SUM(o.total_paise),0) FROM orders o WHERE o.retailer_id = u.id AND o.created_at BETWEEN ? AND ? AND o.status NOT IN ('rejected','cancelled')${d ? ' AND o.distributor_id = ?' : ''}) gmv,
-          (SELECT COALESCE(SUM(GREATEST(x.balance_due_paise,0)),0) FROM retailer_distributor_relations x WHERE x.retailer_id = u.id AND x.status = 'active'${d ? ' AND x.distributor_id = ?' : ''}) owes
+          (SELECT COUNT(*) FROM orders o WHERE o.retailer_id = u.id AND o.created_at BETWEEN ? AND ?${d ? ' AND o.distributor_id IN (?)' : ''}) orders,
+          (SELECT COALESCE(SUM(o.total_paise),0) FROM orders o WHERE o.retailer_id = u.id AND o.created_at BETWEEN ? AND ? AND o.status NOT IN ('rejected','cancelled')${d ? ' AND o.distributor_id IN (?)' : ''}) gmv,
+          (SELECT COALESCE(SUM(GREATEST(x.balance_due_paise,0)),0) FROM retailer_distributor_relations x WHERE x.retailer_id = u.id AND x.status = 'active'${d ? ' AND x.distributor_id IN (?)' : ''}) owes
         FROM users u JOIN retailer_profiles rp ON rp.user_id = u.id WHERE u.role = 'retailer'
-        ${d ? 'AND EXISTS (SELECT 1 FROM retailer_distributor_relations z WHERE z.retailer_id = u.id AND z.distributor_id = ?)' : ''}
+        ${d ? 'AND EXISTS (SELECT 1 FROM retailer_distributor_relations z WHERE z.retailer_id = u.id AND z.distributor_id IN (?))' : ''}
         ORDER BY rp.shop_name LIMIT ${LIMIT}`,
         d ? [r.from, r.to, d, r.from, r.to, d, d, d] : [r.from, r.to, r.from, r.to]);
       return rows.map((x) => ({ shop: x.shop_name, owner: x.owner, phone: x.phone, pincode: x.pincode, joined: ts(x.created_at), orders: Number(x.orders), gmv: money(x.gmv), owes: money(x.owes) }));
@@ -114,7 +114,7 @@ export const REPORTS: ReportDef[] = [
     async rows(r, d) {
       const rows = await q<any>(pool, `SELECT lt.created_at, dp.business_name distributor, rp.shop_name retailer, lt.type, lt.payment_mode, lt.amount_paise, lt.order_id
         FROM ledger_transactions lt JOIN distributor_profiles dp ON dp.user_id = lt.distributor_id JOIN retailer_profiles rp ON rp.user_id = lt.retailer_id
-        WHERE lt.type IN ('payment_cash','payment_online') AND lt.created_at BETWEEN ? AND ?${d ? ' AND lt.distributor_id = ?' : ''} ORDER BY lt.id LIMIT ${LIMIT}`, d ? [r.from, r.to, d] : [r.from, r.to]);
+        WHERE lt.type IN ('payment_cash','payment_online') AND lt.created_at BETWEEN ? AND ?${d ? ' AND lt.distributor_id IN (?)' : ''} ORDER BY lt.id LIMIT ${LIMIT}`, d ? [r.from, r.to, d] : [r.from, r.to]);
       return rows.map((x) => ({ at: ts(x.created_at), distributor: x.distributor, retailer: x.retailer, type: x.type, mode: x.payment_mode ?? '', amount: money(x.amount_paise), order: x.order_id ?? '' }));
     },
   },
@@ -127,7 +127,7 @@ export const REPORTS: ReportDef[] = [
     async rows(_r, d) {
       const rows = await q<any>(pool, `SELECT dp.business_name distributor, rp.shop_name retailer, u.phone, x.balance_due_paise, x.credit_limit_paise, x.credit_days
         FROM retailer_distributor_relations x JOIN distributor_profiles dp ON dp.user_id = x.distributor_id JOIN retailer_profiles rp ON rp.user_id = x.retailer_id JOIN users u ON u.id = x.retailer_id
-        WHERE x.status = 'active' AND x.balance_due_paise <> 0${d ? ' AND x.distributor_id = ?' : ''} ORDER BY x.balance_due_paise DESC LIMIT ${LIMIT}`, d ? [d] : []);
+        WHERE x.status = 'active' AND x.balance_due_paise <> 0${d ? ' AND x.distributor_id IN (?)' : ''} ORDER BY x.balance_due_paise DESC LIMIT ${LIMIT}`, d ? [d] : []);
       return rows.map((x) => ({ distributor: x.distributor, retailer: x.retailer, phone: x.phone, owes: money(x.balance_due_paise), limit: x.credit_limit_paise == null ? '' : money(x.credit_limit_paise), days: x.credit_days }));
     },
   },
@@ -140,7 +140,7 @@ export const REPORTS: ReportDef[] = [
       const rows = await q<any>(pool, `
         SELECT dp.business_name distributor, COUNT(DISTINCT e.order_id) orders, COALESCE(SUM(CASE WHEN e.kind <> 'reversal' THEN e.basis_paise END),0) gross, SUM(e.amount_paise) commission
         FROM commission_entries e JOIN distributor_profiles dp ON dp.user_id = e.distributor_id
-        WHERE e.occurred_at BETWEEN ? AND ?${d ? ' AND e.distributor_id = ?' : ''}
+        WHERE e.occurred_at BETWEEN ? AND ?${d ? ' AND e.distributor_id IN (?)' : ''}
         GROUP BY e.distributor_id, dp.business_name ORDER BY commission DESC LIMIT ${LIMIT}`, d ? [r.from, r.to, d] : [r.from, r.to]);
       return rows.map((x) => ({ distributor: x.distributor, orders: Number(x.orders), gross: money(x.gross), commission: money(x.commission) }));
     },

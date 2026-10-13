@@ -9,6 +9,8 @@ import { fromPaise } from '../../utils/money';
 import { notifyUsers } from '../../services/notify';
 import { AppError, asyncHandler, notFound } from '../../utils/errors';
 import { assertPermission, assertSubscriptionActive, loadDistributor } from './subscription';
+import { mergeSocial, parseSocial, socialInput } from './social';
+import { categoryNames, distributorCategoryIds, retailerCategoryIds, validateCategoryChoice } from '../catalog/scope';
 
 export const distributorRouter = Router();
 distributorRouter.use(authenticate);
@@ -17,10 +19,11 @@ const publicProfile = (d: any) => ({
   id: d.user_id, business_name: d.business_name, gst_no: d.gst_no, address: d.address ?? null, city: d.city ?? null, pincode: d.pincode ?? null,
   bank_account_details: d.bank_account_details ? JSON.parse(d.bank_account_details) : null,
   permissions: d.permissions, commission_rate_bps: d.commission_rate_bps, subscription_ends_at: d.subscription_ends_at,
+  social_links: parseSocial(d.social_links), review_required: !!d.review_required,
 });
 
 distributorRouter.get('/me', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
-  const profile = publicProfile(await loadDistributor(pool, req.auth!.distributorId!));
+  const profile = { ...publicProfile(await loadDistributor(pool, req.auth!.distributorId!)), categories: await categoryNames(pool, await distributorCategoryIds(pool, req.auth!.distributorId!)) };
   // delivery staff never see the owner's bank account; they only learn whether online payments are set up
   if (req.auth!.role === 'employee') return res.json({ ...profile, bank_account_details: null, upi_enabled: !!profile.bank_account_details?.upi_id });
   res.json({ ...profile, upi_enabled: !!profile.bank_account_details?.upi_id });
@@ -41,12 +44,17 @@ distributorRouter.put('/me', requireRole('distributor'), asyncHandler(async (req
     gst_no: z.string().trim().toUpperCase().regex(/^\d{2}[A-Z0-9]{13}$/, 'GSTIN must be 15 characters').optional(),
     bank_account_details: bankSchema.optional(),
     address: z.string().trim().min(3).max(255).optional(), city: z.string().trim().min(2).max(100).optional(), pincode: z.string().regex(/^\d{6}$/, 'Pincode is 6 digits').optional(),
+    social_links: socialInput.optional(),
   }).parse(req.body);
   const id = req.auth!.userId;
   await assertSubscriptionActive(pool, id);
+  let social: string | null = null;
+  if (b.social_links) {
+    try { social = JSON.stringify(mergeSocial(parseSocial((await loadDistributor(pool, id) as any).social_links), b.social_links)); } catch (e: any) { throw new AppError(400, 'BAD_LINK', e.message); }
+  }
   await exec(pool, `UPDATE distributor_profiles SET business_name = COALESCE(?, business_name), gst_no = COALESCE(?, gst_no), bank_account_details = COALESCE(?, bank_account_details),
-    address = COALESCE(?, address), city = COALESCE(?, city), pincode = COALESCE(?, pincode) WHERE user_id = ?`, [
-    b.business_name ?? null, b.gst_no ?? null, b.bank_account_details ? JSON.stringify(b.bank_account_details) : null, b.address ?? null, b.city ?? null, b.pincode ?? null, id,
+    address = COALESCE(?, address), city = COALESCE(?, city), pincode = COALESCE(?, pincode), social_links = COALESCE(?, social_links) WHERE user_id = ?`, [
+    b.business_name ?? null, b.gst_no ?? null, b.bank_account_details ? JSON.stringify(b.bank_account_details) : null, b.address ?? null, b.city ?? null, b.pincode ?? null, social, id,
   ]);
   if (b.bank_account_details) await audit(id, 'distributor.payment_details_changed', 'distributor', id, { upi: !!b.bank_account_details.upi_id });
   res.json(publicProfile(await loadDistributor(pool, id)));
@@ -165,10 +173,15 @@ distributorRouter.post('/retailer-accounts', requireRole('distributor', 'employe
     address: z.string().trim().min(3).max(255).optional(),
     gst_no: z.string().trim().toUpperCase().regex(/^\d{2}[A-Z0-9]{13}$/, 'GSTIN must be 15 characters').optional(),
     managed_by_id: z.number().int().positive().optional(),
+    // the categories this retailer may see prices for and order from (required when the distributor has categories set up)
+    category_ids: z.array(z.number().int().positive()).max(30).optional(),
   }).parse(req.body);
   const actor = req.auth!.userId;
   const distributorId = req.auth!.distributorId!;
   await assertSubscriptionActive(pool, distributorId);
+  const offered = await distributorCategoryIds(pool, distributorId);
+  if (offered.length && !(b.category_ids?.length)) throw new AppError(400, 'CATEGORY_REQUIRED', 'Choose the categories this retailer buys from you');
+  const categories = await validateCategoryChoice(pool, b.category_ids ?? [], offered);
 
   let managedBy: number | null = null;
   if (req.auth!.role === 'employee') {
@@ -192,6 +205,7 @@ distributorRouter.post('/retailer-accounts', requireRole('distributor', 'employe
       await exec(c, 'INSERT INTO retailer_profiles (user_id, shop_name, pincode, address, gst_no) VALUES (?,?,?,?,?)', [u.insertId, b.shop_name, b.pincode, b.address ?? null, b.gst_no ?? null]);
       // brought in by this distributor: connected straight away, and their first (pinned) supplier
       await exec(c, "INSERT INTO retailer_distributor_relations (retailer_id, distributor_id, is_primary, status, requested_by) VALUES (?,?,1,'active','distributor')", [u.insertId, distributorId]);
+      if (categories.length) await exec(c, 'INSERT INTO retailer_categories (retailer_id, category_id) VALUES ?', [categories.map((x) => [u.insertId, x])]);
       return u.insertId as number;
     });
   } catch (e: any) {
@@ -199,7 +213,7 @@ distributorRouter.post('/retailer-accounts', requireRole('distributor', 'employe
     throw e;
   }
   await audit(actor, 'retailer.create', 'user', id, { phone: b.phone, distributor_id: distributorId, managed_by_id: managedBy });
-  res.status(201).json({ id, phone: b.phone, name: b.name, shop_name: b.shop_name, managed_by_id: managedBy });
+  res.status(201).json({ id, phone: b.phone, name: b.name, shop_name: b.shop_name, managed_by_id: managedBy, category_ids: categories });
 }));
 
 // Ask an existing retailer (by phone) to become a customer. Nothing is shared or posted until THEY accept.
@@ -224,7 +238,8 @@ distributorRouter.get('/retailers', requireRole('distributor', 'employee'), asyn
   const onlyMine = mine === '1' && req.auth!.role === 'employee';
   const rows = await q<any>(pool, `
     SELECT u.id, u.name, u.phone, rp.shop_name, rp.pincode, rdr.is_primary, rdr.balance_due_paise, rdr.credit_limit_paise, rdr.credit_days,
-      u.created_by, u.managed_by_id, mb.name managed_by_name
+      u.created_by, u.managed_by_id, mb.name managed_by_name,
+      (SELECT GROUP_CONCAT(c.name ORDER BY c.name SEPARATOR ', ') FROM retailer_categories rc JOIN categories c ON c.id = rc.category_id WHERE rc.retailer_id = u.id) category_names
     FROM retailer_distributor_relations rdr JOIN users u ON u.id = rdr.retailer_id
     JOIN retailer_profiles rp ON rp.user_id = u.id LEFT JOIN users mb ON mb.id = u.managed_by_id
     WHERE rdr.distributor_id = ? AND rdr.status = 'active' ${onlyMine ? 'AND u.managed_by_id = ?' : ''} ORDER BY rp.shop_name`,
@@ -234,6 +249,28 @@ distributorRouter.get('/retailers', requireRole('distributor', 'employee'), asyn
     SELECT u.id, u.phone FROM retailer_distributor_relations rdr JOIN users u ON u.id = rdr.retailer_id
     WHERE rdr.distributor_id = ? AND rdr.status = 'pending' AND rdr.requested_by = 'distributor'`, [req.auth!.distributorId]);
   res.json({ retailers: rows, pending });
+}));
+
+// Which categories a retailer may see prices for and order from. A retailer with none sees everything this distributor sells.
+distributorRouter.put('/retailers/:retailerId/categories', requireRole('distributor'), asyncHandler(async (req, res) => {
+  const { category_ids } = z.object({ category_ids: z.array(z.number().int().positive()).max(30) }).parse(req.body);
+  const d = req.auth!.userId; const rid = idParam(req, 'retailerId');
+  if (!(await q1(pool, "SELECT 1 FROM retailer_distributor_relations WHERE retailer_id = ? AND distributor_id = ? AND status = 'active'", [rid, d]))) throw notFound('Retailer');
+  const offered = await distributorCategoryIds(pool, d);
+  if (offered.length && !category_ids.length) throw new AppError(400, 'CATEGORY_REQUIRED', 'Choose at least one category');
+  const cats = await validateCategoryChoice(pool, category_ids, offered);
+  await withTx(async (c) => {
+    await exec(c, 'DELETE FROM retailer_categories WHERE retailer_id = ?', [rid]);
+    if (cats.length) await exec(c, 'INSERT INTO retailer_categories (retailer_id, category_id) VALUES ?', [cats.map((x) => [rid, x])]);
+  });
+  await audit(d, 'retailer.categories', 'user', rid, { category_ids: cats });
+  res.json({ retailer_id: rid, category_ids: cats });
+}));
+
+distributorRouter.get('/retailers/:retailerId/categories', requireRole('distributor'), asyncHandler(async (req, res) => {
+  const d = req.auth!.userId; const rid = idParam(req, 'retailerId');
+  if (!(await q1(pool, "SELECT 1 FROM retailer_distributor_relations WHERE retailer_id = ? AND distributor_id = ? AND status = 'active'", [rid, d]))) throw notFound('Retailer');
+  res.json({ categories: await categoryNames(pool, await retailerCategoryIds(pool, rid)), offered: await categoryNames(pool, await distributorCategoryIds(pool, d)) });
 }));
 
 distributorRouter.delete('/retailers/:retailerId', requireRole('distributor'), asyncHandler(async (req, res) => {

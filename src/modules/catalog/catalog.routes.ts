@@ -14,6 +14,7 @@ import { EXT, sniffImage, storage } from '../../services/storage';
 import { idsToNames, listVersions, syncProduct } from './governance';
 import { reservedByProduct } from '../inventory/inventory.service';
 import { effectiveTable, loadRules } from '../pricing/resolver';
+import { allowedCategoryIds, assertCategoryAllowed, audienceClause, categoryClause, listableCategories } from './scope';
 
 export const catalogRouter = Router();
 catalogRouter.use(authenticate);
@@ -54,8 +55,11 @@ export async function presentProducts(c: Conn, rows: any[]) {
   const tiers = await loadTiers(c, ids);
   const reserved = await reservedByProduct(c, ids);
   const imgs = ids.length ? await q<any>(c, 'SELECT id, product_id, file_key FROM product_images WHERE product_id IN (?) ORDER BY position, id', [ids]) : [];
+  const priv = ids.length ? await q<any>(c, 'SELECT product_id, COUNT(*) n FROM product_audience WHERE product_id IN (?) GROUP BY product_id', [ids]) : [];
+  const privateCount = new Map<number, number>(priv.map((x) => [x.product_id, Number(x.n)]));
   return rows.map((r) => ({
     ...presentProduct(r, tiers.get(r.id) ?? [], imgs.filter((i) => i.product_id === r.id)),
+    private_to: privateCount.get(r.id) ?? 0,
     reserved_qty: reserved.get(r.id) ?? 0, available_qty: Math.max(0, r.stock_qty - (reserved.get(r.id) ?? 0)),
   }));
 }
@@ -64,10 +68,17 @@ export async function presentProducts(c: Conn, rows: any[]) {
 export async function storefrontProducts(distributorId: number, opts: { q?: string; category?: string; limit?: number; offset?: number; retailerId?: number } = {}) {
   const where = ['distributor_id = ?', 'deleted_at IS NULL', 'is_active = 1', "review_status = 'approved'"];
   const args: unknown[] = [distributorId];
+  // a retailer given categories sees (and so can price and order) only products of those; others see everything
+  const scopeIds = opts.retailerId ? await allowedCategoryIds(pool, opts.retailerId, distributorId) : null;
+  const scope = categoryClause(scopeIds);
+  if (scopeIds !== null) { where.push(scopeIds.length ? 'category_id IN (?)' : '1 = 0'); if (scopeIds.length) args.push(scopeIds); }
+  // products kept for chosen retailers are invisible to everyone else
+  const own = audienceClause(opts.retailerId);
+  where.push(own.sql.replace(/^ AND /, '')); args.push(...own.args);
   if (opts.q) { where.push('(name LIKE ? OR brand LIKE ? OR sku LIKE ? OR barcode = ? OR variant_group LIKE ?)'); const like = `%${opts.q}%`; args.push(like, like, like, opts.q, like); }
   if (opts.category) { where.push('category = ?'); args.push(opts.category); }
   const rows = await q<any>(pool, `SELECT * FROM products WHERE ${where.join(' AND ')} ORDER BY (stock_qty > 0) DESC, COALESCE(variant_group, name), name, variant_label LIMIT ? OFFSET ?`, [...args, opts.limit ?? 200, opts.offset ?? 0]);
-  const categories = (await q<any>(pool, 'SELECT DISTINCT category FROM products WHERE distributor_id = ? AND deleted_at IS NULL AND is_active = 1 AND category IS NOT NULL ORDER BY category', [distributorId])).map((r) => r.category as string);
+  const categories = (await q<any>(pool, `SELECT DISTINCT category FROM products WHERE distributor_id = ? AND deleted_at IS NULL AND is_active = 1 AND review_status = 'approved' AND category IS NOT NULL${scope.sql}${own.sql} ORDER BY category`, [distributorId, ...scope.args, ...own.args])).map((r) => r.category as string);
   const products = await presentProducts(pool, rows);
   if (opts.retailerId) await applyCustomerPrices(products, rows, distributorId, opts.retailerId);
   return { products, categories };
@@ -210,10 +221,11 @@ catalogRouter.get('/', requireRole('distributor', 'employee'), asyncHandler(asyn
 
 // Find a product by scanning its barcode.
 // The managed lists a distributor picks from. Retired entries are not offered.
-catalogRouter.get('/taxonomy', requireRole('distributor', 'employee'), asyncHandler(async (_req, res) => {
-  const categories = await q<any>(pool, "SELECT id, parent_id, name, status FROM categories WHERE status <> 'retired' ORDER BY sort_order, name");
+catalogRouter.get('/taxonomy', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
+  const limited = await listableCategories(pool, req.auth!.distributorId!);
+  const categories = limited ?? await q<any>(pool, "SELECT id, parent_id, name, status FROM categories WHERE status <> 'retired' ORDER BY sort_order, name");
   const brands = await q<any>(pool, "SELECT id, name, status FROM brands WHERE status <> 'retired' ORDER BY name");
-  res.json({ categories, brands });
+  res.json({ categories, brands, restricted: limited !== null });
 }));
 
 catalogRouter.get('/lookup', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
@@ -252,6 +264,30 @@ catalogRouter.get('/:id', requireRole('distributor', 'employee'), asyncHandler(a
   });
 }));
 
+// Keep a product for chosen retailers only (an empty list opens it to everyone again). Only the distributor's own connected retailers.
+catalogRouter.get('/:id/audience', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
+  const id = idParam(req);
+  if (!(await q1(pool, 'SELECT 1 FROM products WHERE id = ? AND distributor_id = ? AND deleted_at IS NULL', [id, req.auth!.distributorId]))) throw notFound('Product');
+  res.json({ retailers: await q(pool, 'SELECT u.id, rp.shop_name FROM product_audience pa JOIN users u ON u.id = pa.retailer_id JOIN retailer_profiles rp ON rp.user_id = u.id WHERE pa.product_id = ? ORDER BY rp.shop_name', [id]) });
+}));
+catalogRouter.put('/:id/audience', ...writer, asyncHandler(async (req, res) => {
+  const { retailer_ids } = z.object({ retailer_ids: z.array(z.number().int().positive()).max(2000) }).parse(req.body);
+  const id = idParam(req); const d = req.auth!.userId;
+  if (!(await q1(pool, 'SELECT 1 FROM products WHERE id = ? AND distributor_id = ? AND deleted_at IS NULL', [id, d]))) throw notFound('Product');
+  const ids = [...new Set(retailer_ids)];
+  if (ids.length) {
+    const ok = await q<any>(pool, "SELECT retailer_id FROM retailer_distributor_relations WHERE distributor_id = ? AND status = 'active' AND retailer_id IN (?)", [d, ids]);
+    const bad = ids.filter((x) => !ok.some((o) => o.retailer_id === x));
+    if (bad.length) throw new AppError(400, 'NOT_YOUR_RETAILER', `Not one of your retailers: ${bad.join(', ')}`);
+  }
+  await withTx(async (c) => {
+    await exec(c, 'DELETE FROM product_audience WHERE product_id = ?', [id]);
+    if (ids.length) await exec(c, 'INSERT INTO product_audience (product_id, retailer_id) VALUES ?', [ids.map((r) => [id, r])]);
+  });
+  await audit(d, 'catalog.audience', 'product', id, { retailers: ids.length });
+  res.json({ product_id: id, private: ids.length > 0, retailers: ids.length });
+}));
+
 catalogRouter.get('/:id/versions', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
   const id = idParam(req);
   if (!(await q1(pool, 'SELECT 1 FROM products WHERE id = ? AND distributor_id = ?', [id, req.auth!.distributorId]))) throw notFound('Product');
@@ -266,6 +302,7 @@ catalogRouter.post('/', ...writer, asyncHandler(async (req, res) => {
   const d = req.auth!.userId;
   await assertSubscriptionActive(pool, d);
   await idsToNames(b);
+  await assertCategoryAllowed(pool, d, b.category);
   const price = toPaise(b.price);
   const mrp = b.mrp == null || b.mrp === '' ? null : toPaise(b.mrp);
   const tiers = checkPricing(price, mrp, toTierRows(b.tiers));
@@ -290,6 +327,7 @@ catalogRouter.post('/', ...writer, asyncHandler(async (req, res) => {
 catalogRouter.patch('/:id', ...writer, asyncHandler(async (req, res) => {
   const body = patchSchema.parse(req.body);
   await idsToNames(body);
+  if (body.category !== undefined) await assertCategoryAllowed(pool, req.auth!.userId, body.category);
   if ('stock_qty' in (req.body ?? {})) throw new AppError(400, 'USE_STOCK_ENDPOINT', 'Change stock with POST /catalog/:id/stock');
   const id = idParam(req);
   const d = req.auth!.userId;
@@ -463,7 +501,10 @@ catalogRouter.post('/bulk/apply', ...writer, asyncHandler(async (req, res) => {
     for (const p of rows) {
       if (b.action === 'activate' || b.action === 'deactivate') await exec(c, 'UPDATE products SET is_active = ? WHERE id = ?', [b.action === 'activate' ? 1 : 0, p.id]);
       else if (b.action === 'delete') await exec(c, 'UPDATE products SET deleted_at = UTC_TIMESTAMP(), is_active = 0, sku = NULL, barcode = NULL WHERE id = ?', [p.id]);
-      else if (b.action === 'set_category') await exec(c, 'UPDATE products SET category = ? WHERE id = ?', [String(b.value ?? '').trim().slice(0, 80) || null, p.id]);
+      else if (b.action === 'set_category') {
+        await assertCategoryAllowed(c, d, String(b.value ?? ''));
+        await exec(c, 'UPDATE products SET category = ? WHERE id = ?', [String(b.value ?? '').trim().slice(0, 80) || null, p.id]);
+      }
       else if (b.action === 'stock_add') {
         const delta = Number(b.value);
         if (!Number.isInteger(delta) || delta === 0) throw new AppError(400, 'VALIDATION', 'value must be a whole number');
@@ -515,8 +556,13 @@ catalogRouter.post('/import/rows', ...writer, asyncHandler(async (req, res) => {
     } catch (e: any) { return errors.push({ row: i + 1, message: e.message }); }
     good.push({ n: i + 1, r: parsed.data });
   });
+  // a distributor with categories may only list products in them
+  const listable: typeof good = [];
+  for (const g of good) {
+    try { await assertCategoryAllowed(pool, d, g.r.category); listable.push(g); } catch (e: any) { errors.push({ row: g.n, message: `category: ${e.message}` }); }
+  }
   const seen = new Set<string>();
-  const unique = good.filter(({ n, r }) => {
+  const unique = listable.filter(({ n, r }) => {
     if (!r.sku) return true;
     if (seen.has(r.sku)) { errors.push({ row: n, message: `sku: "${r.sku}" appears twice in this file` }); return false; }
     seen.add(r.sku); return true;

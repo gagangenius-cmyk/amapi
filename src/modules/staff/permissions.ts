@@ -12,6 +12,8 @@ export const STAFF_ACTIONS = [
   { key: 'manage_distributors', label: 'Manage their distributors', help: 'Change feature switches, extend the subscription, suspend or restore distributors they created' },
   { key: 'view_all_distributors', label: 'See every distributor', help: 'Read-only list of all distributors, not only the ones they created' },
   { key: 'view_commissions', label: 'See commissions', help: 'Read the out-of-hierarchy commission report' },
+  { key: 'review_products', label: 'Review products', help: 'Approve or send back products listed by the distributors they onboarded, before retailers can see them' },
+  { key: 'view_team_reports', label: 'See reports of their distributors', help: 'Sales, orders, stock and payment reports for the distributors they onboarded' },
   { key: 'handle_support', label: 'Handle support tickets', help: 'Answer, assign and resolve tickets raised by retailers and distributors' },
   { key: 'support_reports', label: 'See support performance', help: 'Response times, SLA compliance and satisfaction' },
 ] as const;

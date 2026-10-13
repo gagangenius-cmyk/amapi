@@ -1,6 +1,7 @@
 import { Conn, exec, pool, q, q1 } from '../../db/pool';
 import { AppError } from '../../utils/errors';
 import { fromPaise } from '../../utils/money';
+import { notifyUsers } from '../../services/notify';
 import { loadTiers } from './stock';
 
 /**
@@ -12,9 +13,13 @@ import { loadTiers } from './stock';
 // ---------------------------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------------------------
-export async function approvalRequired(c: Conn = pool): Promise<boolean> {
+/** The platform-wide switch, or (with a distributor) that distributor's own: products of a distributor onboarded for review wait too. */
+export async function approvalRequired(c: Conn = pool, distributorId?: number): Promise<boolean> {
   const r = await q1<{ value: string }>(c, "SELECT value FROM platform_settings WHERE name = 'product_approval_required'");
-  return r?.value === '1';
+  if (r?.value === '1') return true;
+  if (!distributorId) return false;
+  const d = await q1<{ review_required: number }>(c, 'SELECT review_required FROM distributor_profiles WHERE user_id = ?', [distributorId]);
+  return !!d?.review_required;
 }
 export async function setApprovalRequired(on: boolean) {
   await exec(pool, "INSERT INTO platform_settings (name, value) VALUES ('product_approval_required', ?) ON DUPLICATE KEY UPDATE value = VALUES(value)", [on ? '1' : '0']);
@@ -141,10 +146,15 @@ export async function syncProduct(c: Conn, productId: number, actorId: number | 
 
   // 2. review: new products wait when approval is on; fixing a rejected product sends it back for another look
   let status: string = p.review_status;
-  if (CREATING.has(changeType)) { if (await approvalRequired(c)) status = 'pending'; }
+  if (CREATING.has(changeType)) { if (await approvalRequired(c, p.distributor_id)) status = 'pending'; }
   else if (status === 'rejected' && (changeType === 'update' || changeType === 'import_update')) status = 'pending';
   if (status !== p.review_status) {
     await exec(c, "UPDATE products SET review_status = ?, review_note = NULL, reviewed_by = NULL, reviewed_at = NULL WHERE id = ?", [status, productId]);
+    // tell whoever onboarded this distributor (they review its products) that something is waiting
+    if (status === 'pending') {
+      const owner = await q1<{ created_by: number | null }>(c, 'SELECT created_by FROM users WHERE id = ?', [p.distributor_id]);
+      if (owner?.created_by) notifyUsers([owner.created_by], 'Product to review', `${p.name} is waiting for your approval.`, { type: 'catalog_review', id: productId });
+    }
   }
 
   // 3. version history

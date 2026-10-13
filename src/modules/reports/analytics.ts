@@ -65,8 +65,10 @@ const dayKey = (v: unknown) => (v instanceof Date ? v.toISOString().slice(0, 10)
 /** First delivered event per order: "delivered in the period" means this timestamp falls inside it. */
 const DELIVERED = `(SELECT order_id, MIN(created_at) at FROM order_events WHERE to_status = 'delivered' GROUP BY order_id)`;
 
-export async function computeAnalytics(r: Range, distributorId?: number) {
-  const dO = distributorId ? ' AND o.distributor_id = ?' : '';
+/** `scope`: only these distributors (an employee's own; never empty - callers pass [0] for none). Undefined = the whole platform. */
+export async function computeAnalytics(r: Range, scope?: number[]) {
+  const distributorId = scope;
+  const dO = distributorId ? ' AND o.distributor_id IN (?)' : '';
   const dArgs = distributorId ? [distributorId] : [];
 
   // ---- orders placed in the period, by status
@@ -89,11 +91,11 @@ export async function computeAnalytics(r: Range, distributorId?: number) {
   const rets = (await q1<any>(pool, `
     SELECT COALESCE(SUM(rt.total_paise),0) incl,
       COALESCE((SELECT SUM(ri.unit_price_paise * ri.qty) FROM order_return_items ri JOIN order_returns r2 ON r2.id = ri.return_id
-        WHERE r2.status = 'approved' AND r2.resolved_at BETWEEN ? AND ?${distributorId ? ' AND r2.distributor_id = ?' : ''}),0) base
-    FROM order_returns rt WHERE rt.status = 'approved' AND rt.resolved_at BETWEEN ? AND ?${distributorId ? ' AND rt.distributor_id = ?' : ''}`,
+        WHERE r2.status = 'approved' AND r2.resolved_at BETWEEN ? AND ?${distributorId ? ' AND r2.distributor_id IN (?)' : ''}),0) base
+    FROM order_returns rt WHERE rt.status = 'approved' AND rt.resolved_at BETWEEN ? AND ?${distributorId ? ' AND rt.distributor_id IN (?)' : ''}`,
     [r.from, r.to, ...dArgs, r.from, r.to, ...dArgs]))!;
-  const comm = (await q1<any>(pool, `SELECT COALESCE(SUM(amount_paise),0) t FROM commission_entries WHERE occurred_at BETWEEN ? AND ?${distributorId ? ' AND distributor_id = ?' : ''}`, [r.from, r.to, ...dArgs]))!;
-  const subs = (await q1<any>(pool, `SELECT COALESCE(SUM(amount_paise),0) t FROM subscription_payments WHERE status = 'confirmed' AND decided_at BETWEEN ? AND ?${distributorId ? ' AND distributor_id = ?' : ''}`, [r.from, r.to, ...dArgs]))!;
+  const comm = (await q1<any>(pool, `SELECT COALESCE(SUM(amount_paise),0) t FROM commission_entries WHERE occurred_at BETWEEN ? AND ?${distributorId ? ' AND distributor_id IN (?)' : ''}`, [r.from, r.to, ...dArgs]))!;
+  const subs = (await q1<any>(pool, `SELECT COALESCE(SUM(amount_paise),0) t FROM subscription_payments WHERE status = 'confirmed' AND decided_at BETWEEN ? AND ?${distributorId ? ' AND distributor_id IN (?)' : ''}`, [r.from, r.to, ...dArgs]))!;
 
   // ---- people in the period
   const people = (await q1<any>(pool, `SELECT COUNT(DISTINCT o.retailer_id) buyers, COUNT(DISTINCT o.distributor_id) distributors
@@ -102,12 +104,12 @@ export async function computeAnalytics(r: Range, distributorId?: number) {
     (SELECT o.retailer_id, COUNT(*) n FROM orders o WHERE o.created_at BETWEEN ? AND ? AND o.status NOT IN ('rejected','cancelled')${dO} GROUP BY o.retailer_id) t`, [r.from, r.to, ...dArgs]))!;
 
   // ---- right now
-  const subscribed = (await q1<any>(pool, `SELECT COUNT(*) n FROM distributor_profiles WHERE subscription_ends_at > UTC_TIMESTAMP()${distributorId ? ' AND user_id = ?' : ''}`, dArgs))!;
-  const prod = (await q1<any>(pool, `SELECT COUNT(*) total, COALESCE(SUM(stock_qty <= low_stock_threshold),0) low FROM products WHERE deleted_at IS NULL AND is_active = 1${distributorId ? ' AND distributor_id = ?' : ''}`, dArgs))!;
-  const pi = (await q1<any>(pool, `SELECT COUNT(*) n, COALESCE(SUM(amount_paise),0) t FROM payment_intents WHERE status = 'pending'${distributorId ? ' AND distributor_id = ?' : ''}`, dArgs))!;
-  const sp = (await q1<any>(pool, `SELECT COUNT(*) n, COALESCE(SUM(amount_paise),0) t FROM subscription_payments WHERE status = 'pending'${distributorId ? ' AND distributor_id = ?' : ''}`, dArgs))!;
-  const due = (await q1<any>(pool, `SELECT COALESCE(SUM(GREATEST(balance_due_paise,0)),0) t FROM retailer_distributor_relations WHERE status = 'active'${distributorId ? ' AND distributor_id = ?' : ''}`, dArgs))!;
-  const pr = (await q1<any>(pool, `SELECT COUNT(*) n, COALESCE(SUM(total_paise),0) t FROM order_returns WHERE status = 'requested'${distributorId ? ' AND distributor_id = ?' : ''}`, dArgs))!;
+  const subscribed = (await q1<any>(pool, `SELECT COUNT(*) n FROM distributor_profiles WHERE subscription_ends_at > UTC_TIMESTAMP()${distributorId ? ' AND user_id IN (?)' : ''}`, dArgs))!;
+  const prod = (await q1<any>(pool, `SELECT COUNT(*) total, COALESCE(SUM(stock_qty <= low_stock_threshold),0) low FROM products WHERE deleted_at IS NULL AND is_active = 1${distributorId ? ' AND distributor_id IN (?)' : ''}`, dArgs))!;
+  const pi = (await q1<any>(pool, `SELECT COUNT(*) n, COALESCE(SUM(amount_paise),0) t FROM payment_intents WHERE status = 'pending'${distributorId ? ' AND distributor_id IN (?)' : ''}`, dArgs))!;
+  const sp = (await q1<any>(pool, `SELECT COUNT(*) n, COALESCE(SUM(amount_paise),0) t FROM subscription_payments WHERE status = 'pending'${distributorId ? ' AND distributor_id IN (?)' : ''}`, dArgs))!;
+  const due = (await q1<any>(pool, `SELECT COALESCE(SUM(GREATEST(balance_due_paise,0)),0) t FROM retailer_distributor_relations WHERE status = 'active'${distributorId ? ' AND distributor_id IN (?)' : ''}`, dArgs))!;
+  const pr = (await q1<any>(pool, `SELECT COUNT(*) n, COALESCE(SUM(total_paise),0) t FROM order_returns WHERE status = 'requested'${distributorId ? ' AND distributor_id IN (?)' : ''}`, dArgs))!;
 
   const deliveredBase = N(items.base);
   const netSales = deliveredBase - N(rets.base);
@@ -120,10 +122,10 @@ export async function computeAnalytics(r: Range, distributorId?: number) {
   const coll = await q<any>(pool, `SELECT DATE(created_at) day,
       COALESCE(SUM(CASE WHEN type IN ('payment_cash','payment_online') THEN amount_paise END),0) collected,
       COALESCE(SUM(CASE WHEN type = 'invoice' THEN amount_paise END),0) invoiced
-    FROM ledger_transactions WHERE created_at BETWEEN ? AND ?${distributorId ? ' AND distributor_id = ?' : ''} GROUP BY DATE(created_at)`, [r.from, r.to, ...dArgs]);
+    FROM ledger_transactions WHERE created_at BETWEEN ? AND ?${distributorId ? ' AND distributor_id IN (?)' : ''} GROUP BY DATE(created_at)`, [r.from, r.to, ...dArgs]);
   const collMap = new Map(coll.map((d) => [dayKey(d.day), d]));
   const acq = distributorId
-    ? await q<any>(pool, 'SELECT DATE(created_at) day, COUNT(*) n FROM retailer_distributor_relations WHERE distributor_id = ? AND created_at BETWEEN ? AND ? GROUP BY DATE(created_at)', [distributorId, r.from, r.to])
+    ? await q<any>(pool, 'SELECT DATE(created_at) day, COUNT(*) n FROM retailer_distributor_relations WHERE distributor_id IN (?) AND created_at BETWEEN ? AND ? GROUP BY DATE(created_at)', [distributorId, r.from, r.to])
     : await q<any>(pool, "SELECT DATE(created_at) day, COUNT(*) n FROM users WHERE role = 'retailer' AND created_at BETWEEN ? AND ? GROUP BY DATE(created_at)", [r.from, r.to]);
   const acqMap = new Map(acq.map((d) => [dayKey(d.day), N(d.n)]));
   const days = eachDay(r);
@@ -144,7 +146,7 @@ export async function computeAnalytics(r: Range, distributorId?: number) {
 
   const repeatBuyers = N(repeat.buyers);
   return {
-    range: { from: r.fromDate, to: r.toDate, days: r.days, timezone: 'UTC', distributor_id: distributorId ?? null },
+    range: { from: r.fromDate, to: r.toDate, days: r.days, timezone: 'UTC', distributor_id: distributorId && distributorId.length === 1 ? distributorId[0] : null, distributors_in_scope: distributorId ? distributorId.length : null },
     kpis: {
       gmv: money(gmv), gross_sales: money(del.gross), tax_collected: money(N(items.incl) - deliveredBase), returns: money(rets.incl), net_sales: money(netSales),
       platform_revenue: money(N(subs.t) + N(comm.t)), platform_revenue_parts: { subscriptions: money(subs.t), commission: money(comm.t) },
