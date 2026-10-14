@@ -40,7 +40,7 @@ const money = (v) => '₹' + Number(v).toLocaleString('en-IN', { minimumFraction
 function loginView() {
   const phone = el('input', { placeholder: 'Phone', inputmode: 'numeric', maxlength: 10, autocomplete: 'username', 'aria-label': 'Phone' });
   const pw = el('input', { type: 'password', placeholder: 'Password', autocomplete: 'current-password', 'aria-label': 'Password' });
-  const code = el('input', { placeholder: 'Authenticator code (if enabled)', inputmode: 'numeric', maxlength: 6, autocomplete: 'one-time-code', 'aria-label': 'Authenticator code' });
+  const code = el('input', { placeholder: 'Email code (press Sign in first to get one)', inputmode: 'numeric', maxlength: 6, autocomplete: 'one-time-code', 'aria-label': 'Email code' });
   const err = el('div', { class: 'err', role: 'alert' });
   const go = async () => {
     err.textContent = '';

@@ -77,7 +77,8 @@ export function idempotencyKey(req: Request): string {
 
 /** Admin and company-employee power needs a second factor (when enforced): checked on every request, so disabling it elsewhere takes effect at once. */
 export async function requireTwoFactor(req: Request, _res: Response, next: NextFunction) {
-  if (!env.adminRequires2fa || (req.auth?.role !== 'admin' && req.auth?.role !== 'company_employee')) return next();
+  // email-code mode: the emailed sign-in code is the second factor, so no authenticator enrolment is required
+  if (env.twoFactorMethod === 'email' || !env.adminRequires2fa || (req.auth?.role !== 'admin' && req.auth?.role !== 'company_employee')) return next();
   try {
     const u = await q1<any>(pool, 'SELECT totp_enabled_at FROM users WHERE id = ?', [req.auth.userId]);
     if (!u?.totp_enabled_at) return next(new AppError(403, 'TWO_FACTOR_REQUIRED', req.auth.role === 'admin' ? 'Turn on two-factor authentication to use admin features' : 'Turn on two-factor authentication (Account screen) to use this area'));

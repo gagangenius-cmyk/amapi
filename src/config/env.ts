@@ -45,7 +45,9 @@ export const env = {
   },
   jwtSecret: resolveJwtSecret(),
   /** Admin accounts must have two-factor on to use admin endpoints. On by default in production; ADMIN_REQUIRE_2FA=0/1 overrides. */
-  adminRequires2fa: process.env.ADMIN_REQUIRE_2FA ? process.env.ADMIN_REQUIRE_2FA === '1' : isProd,
+  /** Second factor for admin/company-employee sign-in. 'email' (current, temporary) emails a code on every sign-in; 'totp' is the authenticator-app flow (kept, switched off for now). */
+  twoFactorMethod: (process.env.TWO_FACTOR_METHOD === 'totp' ? 'totp' : 'email') as 'totp' | 'email',
+  adminRequires2fa:process.env.ADMIN_REQUIRE_2FA ? process.env.ADMIN_REQUIRE_2FA === '1' : isProd,
   uploadDir: process.env.UPLOAD_DIR ?? 'uploads',
   accessTtlMin: Number(process.env.ACCESS_TTL_MIN ?? 15),
   refreshTtlDays: Number(process.env.REFRESH_TTL_DAYS ?? 30),

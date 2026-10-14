@@ -124,7 +124,9 @@ authRouter.post('/register', asyncHandler(async (req, res) => {
  * Accounts with two-factor on must present a fresh authenticator code on EVERY credential path (password and emailed code),
  * otherwise the weaker path would bypass it. A wrong code counts toward the lockout like a wrong password.
  */
-async function requireSecondFactor(u: any, code?: string) {
+async function requireSecondFactor(u: any, code?: string, viaEmailCode = false) {
+  if (env.twoFactorMethod === 'email') return requireEmailSecondFactor(u, code, viaEmailCode);
+  // --- authenticator-app (TOTP) flow: switched off for now (TWO_FACTOR_METHOD=totp turns it back on) ---
   if (!u.totp_enabled_at) return;
   if (!code) throw new AppError(401, 'TOTP_REQUIRED', 'Enter the 6-digit code from your authenticator app');
   const step = totp.verifyTotp(totp.open(u.totp_secret), code);
@@ -135,6 +137,32 @@ async function requireSecondFactor(u: any, code?: string) {
     throw new AppError(401, 'BAD_TOTP', 'That code is wrong or was already used');
   }
   await exec(pool, 'UPDATE users SET totp_last_step = ? WHERE id = ?', [step, u.id]); // a code works once
+}
+
+/**
+ * Temporary stand-in for the authenticator app: admin and company-employee sign-ins need a code emailed to the account.
+ * First attempt (no code) emails one and answers TOTP_REQUIRED, so existing clients just show their code box; the retry carries the code.
+ * Signing in with an emailed code (/otp/verify) already proved the inbox, so that path needs nothing more.
+ */
+async function requireEmailSecondFactor(u: any, code?: string, viaEmailCode = false) {
+  if (viaEmailCode || (u.role !== 'admin' && u.role !== 'company_employee')) return;
+  if (!u.email) {
+    if (env.adminRequires2fa) throw new AppError(403, 'NO_EMAIL', 'Add an email address to this account to receive sign-in codes');
+    return;
+  }
+  const identifier = `2fa:${u.id}`;
+  if (!code) {
+    const delivered = await mailCode(u.email, await createOtp(pool, identifier, 'login'), 'login', u.id);
+    if (!delivered) throw new AppError(503, 'EMAIL_FAILED', 'Could not email your sign-in code. Try again shortly.');
+    throw new AppError(401, 'TOTP_REQUIRED', 'Enter the 6-digit code we emailed you');
+  }
+  try { await consumeOtp(identifier, 'login', code); }
+  catch (e) {
+    await audit(u.id, 'auth.totp_failed', 'user', u.id);
+    await exec(pool, `UPDATE users SET locked_until = IF(failed_logins + 1 >= ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? MINUTE), locked_until),
+      failed_logins = IF(failed_logins + 1 >= ?, 0, failed_logins + 1) WHERE id = ?`, [MAX_FAILED_LOGINS, LOCK_MINUTES, MAX_FAILED_LOGINS, u.id]);
+    throw e;
+  }
 }
 
 authRouter.post('/login', asyncHandler(async (req, res) => {
@@ -213,7 +241,7 @@ authRouter.post('/otp/verify', asyncHandler(async (req, res) => {
   await consumeOtp(b.identifier, b.purpose, b.code);
   const u = await findByIdentifier(b.identifier);
   if (!u) throw new AppError(401, 'BAD_OTP', 'Invalid or expired code');
-  await requireSecondFactor(u, b.totp);
+  await requireSecondFactor(u, b.totp, true);
   // receiving the code proves control of the inbox
   if (u.email && !u.email_verified_at) await exec(pool, 'UPDATE users SET email_verified_at = UTC_TIMESTAMP() WHERE id = ?', [u.id]);
   if (b.purpose === 'reset') {
