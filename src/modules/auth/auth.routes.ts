@@ -244,6 +244,10 @@ authRouter.post('/otp/verify', asyncHandler(async (req, res) => {
   // TEMPORARY test aid: the fixed TEST_OTP signs in the listed test accounts without an email (sign-in only, never password reset).
   const testBypass = !!env.testOtp && b.purpose === 'login' && b.code === env.testOtp && !!u
     && [b.identifier, u.email, u.phone].some((x) => x && env.testOtpAccounts.includes(String(x).toLowerCase()));
+  // Test accounts only: say plainly when the test code was right but no active account matches (otherwise it looks like a wrong code).
+  if (env.testOtp && b.purpose === 'login' && b.code === env.testOtp && !u && env.testOtpAccounts.includes(b.identifier.toLowerCase())) {
+    throw new AppError(404, 'TEST_ACCOUNT_NOT_FOUND', 'Test code accepted, but no active account has this email/phone. Check the users table.');
+  }
   if (testBypass) logger.warn({ userId: u.id }, 'TEST_OTP used for code sign-in');
   else await consumeOtp(b.identifier, b.purpose, b.code);
   if (!u) throw new AppError(401, 'BAD_OTP', 'Invalid or expired code');
