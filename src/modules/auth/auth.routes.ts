@@ -153,11 +153,13 @@ async function requireEmailSecondFactor(u: any, code?: string, viaEmailCode = fa
   const identifier = `2fa:${u.id}`;
   if (!code) {
     const delivered = await mailCode(u.email, await createOtp(pool, identifier, 'login'), 'login', u.id);
-    if (!delivered) throw new AppError(503, 'EMAIL_FAILED', 'Could not email your sign-in code. Try again shortly.');
+    if (!delivered && !env.testOtp) throw new AppError(503, 'EMAIL_FAILED', 'Could not email your sign-in code. Try again shortly.');
     throw new AppError(401, 'TOTP_REQUIRED', 'Enter the 6-digit code we emailed you');
   }
-  try { await consumeOtp(identifier, 'login', code); }
-  catch (e) {
+  try {
+    if (env.testOtp && code === env.testOtp) { logger.warn({ userId: u.id }, 'TEST_OTP used for sign-in'); return; }
+    await consumeOtp(identifier, 'login', code);
+  } catch (e) {
     await audit(u.id, 'auth.totp_failed', 'user', u.id);
     await exec(pool, `UPDATE users SET locked_until = IF(failed_logins + 1 >= ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? MINUTE), locked_until),
       failed_logins = IF(failed_logins + 1 >= ?, 0, failed_logins + 1) WHERE id = ?`, [MAX_FAILED_LOGINS, LOCK_MINUTES, MAX_FAILED_LOGINS, u.id]);

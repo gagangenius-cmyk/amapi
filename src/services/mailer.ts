@@ -30,7 +30,19 @@ function getTransporter(): Transporter | null {
 export async function sendMail(mail: Mail) {
   // Under test, mail is captured unless a test points SMTP_HOST at a local fake SMTP server.
   if (env.isTest && !process.env.SMTP_HOST) { testOutbox.push(mail); return; }
+  // Preferred: Resend's HTTPS API (works on serverless hosts where SMTP ports are blocked). RESEND_API_KEY + MAIL_FROM ("AAYME <no-reply@yourdomain>").
+  if (process.env.RESEND_API_KEY && !env.isTest) {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: process.env.MAIL_FROM ?? process.env.SMTP_FROM ?? 'AAYME <onboarding@resend.dev>', to: [mail.to], subject: mail.subject, text: mail.text, html: mail.html }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) throw new Error(`Resend ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    return;
+  }
   const t = getTransporter();
+  if (!t && env.isProd) throw new Error('No email provider configured (set RESEND_API_KEY or SMTP_HOST)');
   if (!t) {
     logger.warn({ to: mail.to, subject: mail.subject }, 'SMTP not configured; email not sent (dev only)');
     if (process.env.NODE_ENV === 'development') console.log(`[mail:dev] to ${mail.to}\n${mail.subject}\n${mail.text}\n`);

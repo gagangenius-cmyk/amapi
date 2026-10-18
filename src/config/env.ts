@@ -47,6 +47,8 @@ export const env = {
   /** Admin accounts must have two-factor on to use admin endpoints. On by default in production; ADMIN_REQUIRE_2FA=0/1 overrides. */
   /** Second factor for admin/company-employee sign-in. 'email' (current, temporary) emails a code on every sign-in; 'totp' is the authenticator-app flow (kept, switched off for now). */
   twoFactorMethod: (process.env.TWO_FACTOR_METHOD === 'totp' ? 'totp' : 'email') as 'totp' | 'email',
+  /** TEMPORARY testing aid: this fixed code (default 123456) is accepted as the emailed sign-in code for admin/company-employee accounts (password is still required). TEST_OTP=off turns it off; TEST_OTP=<6 digits> changes it. Never active under test. */
+  testOtp: (() => { const v = process.env.TEST_OTP ?? '123456'; return isTest || !/^\d{6}$/.test(v) ? null : v; })(),
   adminRequires2fa:process.env.ADMIN_REQUIRE_2FA ? process.env.ADMIN_REQUIRE_2FA === '1' : isProd,
   uploadDir: process.env.UPLOAD_DIR ?? 'uploads',
   accessTtlMin: Number(process.env.ACCESS_TTL_MIN ?? 15),
@@ -62,4 +64,5 @@ if (isProd) {
 } else if (!isTest && !process.env.NODE_ENV) {
   console.warn('[config] NODE_ENV is not set; running with development settings. Set NODE_ENV=production on servers.');
 }
+if (env.testOtp) console.warn('[config] TEST_OTP is active: a fixed sign-in code is accepted for admin/employee accounts. Set TEST_OTP=off before real use.');
 if (env.otpDevEcho && !isTest) console.warn('[config] OTP_DEV_ECHO is on: login codes are returned in API responses (development only).');
