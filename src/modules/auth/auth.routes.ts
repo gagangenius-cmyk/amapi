@@ -240,8 +240,12 @@ authRouter.post('/otp/request', asyncHandler(async (req, res) => {
 authRouter.post('/otp/verify', asyncHandler(async (req, res) => {
   const b = z.object({ identifier: identifierSchema, purpose: z.enum(['login', 'reset']), code: z.string().regex(/^\d{6}$/), new_password: z.string().min(8).max(100).optional(), totp: z.string().regex(/^\d{6}$/).optional() }).parse(req.body);
   if (b.purpose === 'reset' && !b.new_password) throw new AppError(400, 'VALIDATION', 'new_password required');
-  await consumeOtp(b.identifier, b.purpose, b.code);
   const u = await findByIdentifier(b.identifier);
+  // TEMPORARY test aid: the fixed TEST_OTP signs in the listed test accounts without an email (sign-in only, never password reset).
+  const testBypass = !!env.testOtp && b.purpose === 'login' && b.code === env.testOtp && !!u
+    && [b.identifier, u.email, u.phone].some((x) => x && env.testOtpAccounts.includes(String(x).toLowerCase()));
+  if (testBypass) logger.warn({ userId: u.id }, 'TEST_OTP used for code sign-in');
+  else await consumeOtp(b.identifier, b.purpose, b.code);
   if (!u) throw new AppError(401, 'BAD_OTP', 'Invalid or expired code');
   await requireSecondFactor(u, b.totp, true);
   // receiving the code proves control of the inbox
