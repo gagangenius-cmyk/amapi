@@ -342,7 +342,8 @@ adminRouter.get('/plans', asyncHandler(async (_req, res) => {
 }));
 adminRouter.post('/plans', asyncHandler(async (req, res) => {
   const b = planBody.parse(req.body); const price = toPaise(b.price);
-  if (price <= 0) throw new AppError(400, 'BAD_AMOUNT', 'Price must be more than zero');
+  // ₹0 is allowed: a free plan (testing) can be used when a company employee onboards a distributor, and is never offered for self-service renewal
+  if (price < 0) throw new AppError(400, 'BAD_AMOUNT', 'Price cannot be negative');
   const r = await exec(pool, 'INSERT INTO subscription_plans (name, days, price_paise, description, is_active, sort_order) VALUES (?,?,?,?,?,?)', [b.name, b.days, price, b.description ?? null, b.is_active ? 1 : 0, b.sort_order]);
   await audit(req.auth!.userId, 'plan.create', 'plan', r.insertId, { name: b.name, days: b.days, price_paise: price });
   res.status(201).json(presentPlan((await q1<any>(pool, 'SELECT * FROM subscription_plans WHERE id = ?', [r.insertId]))));
@@ -353,7 +354,8 @@ adminRouter.put('/plans/:id', asyncHandler(async (req, res) => {
   const cur = await q1<any>(pool, 'SELECT * FROM subscription_plans WHERE id = ?', [id]);
   if (!cur) throw new AppError(404, 'NOT_FOUND', 'Plan not found');
   const price = b.price === undefined ? Number(cur.price_paise) : toPaise(b.price);
-  if (price <= 0) throw new AppError(400, 'BAD_AMOUNT', 'Price must be more than zero');
+  // ₹0 is allowed: a free plan (testing) can be used when a company employee onboards a distributor, and is never offered for self-service renewal
+  if (price < 0) throw new AppError(400, 'BAD_AMOUNT', 'Price cannot be negative');
   await exec(pool, 'UPDATE subscription_plans SET name=?, days=?, price_paise=?, description=?, is_active=?, sort_order=? WHERE id=?', [
     b.name ?? cur.name, b.days ?? cur.days, price, b.description === undefined ? cur.description : b.description, b.is_active === undefined ? cur.is_active : b.is_active ? 1 : 0, b.sort_order ?? cur.sort_order, id,
   ]);

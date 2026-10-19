@@ -37,6 +37,10 @@ export const staffOnboardingRouter = Router();
 
 staffOnboardingRouter.get('/meta', requireStaffAction('create_distributors'), asyncHandler(async (req, res) => {
   const p = await loadStaffPermissions(req.auth!.userId);
+  // Testing period: make sure a "₹0" plan exists to pick (created once, the admin can rename, hide or delete it later).
+  if (env.freeOnboarding && !(await q1(pool, 'SELECT id FROM subscription_plans WHERE price_paise = 0 LIMIT 1'))) {
+    await exec(pool, "INSERT INTO subscription_plans (name, days, price_paise, description, is_active, sort_order) VALUES ('Free trial (testing)', 30, 0, 'No fee. For testing.', 1, 0)");
+  }
   const [plans, categories, company] = await Promise.all([
     q<any>(pool, 'SELECT id, name, days, price_paise, description FROM subscription_plans WHERE is_active = 1 ORDER BY sort_order, days'),
     q<any>(pool, "SELECT id, name, parent_id FROM categories WHERE status <> 'retired' ORDER BY name"),
@@ -46,6 +50,7 @@ staffOnboardingRouter.get('/meta', requireStaffAction('create_distributors'), as
     plans: plans.map((x) => ({ id: x.id, name: x.name, days: x.days, price: env.freeOnboarding ? '0.00' : fromPaise(Number(x.price_paise)), description: x.description })),
     categories, grant_catalog: grantCatalog(p.grantable),
     free_mode: env.freeOnboarding,
+    free_plan_ids: plans.filter((x) => Number(x.price_paise) === 0).map((x) => x.id),
     pay_by_upi: !!company.upi_id, pay_by_gateway: !!getGateway(),
     reviews_products: p.actions.includes('review_products'),
   });
@@ -64,7 +69,7 @@ staffOnboardingRouter.post('/', requireStaffAction('create_distributors'), async
   const permissions = resolvePermissions(b.permissions, perms.grantable, null);
   const categories = await validateCategoryChoice(pool, b.category_ids);
   const company = await companyPayment();
-  const free = env.freeOnboarding; // testing period: no fee, no payment step
+  const free = env.freeOnboarding || Number(plan.price_paise) === 0; // testing period (or a ₹0 plan): no fee, no payment step
   if (!free && b.method === 'upi' && !company.upi_id) throw new AppError(501, 'NO_COMPANY_UPI', 'The company UPI id is not set up yet. Ask the admin to add it.');
   const gw = !free && b.method === 'gateway' ? getGateway() : null;
   if (!free && b.method === 'gateway' && !gw) throw new AppError(501, 'GATEWAY_NOT_CONFIGURED', 'Online payment links are not available. Use UPI.');

@@ -39,3 +39,19 @@ describe('free onboarding (testing period)', () => {
     expect(new Date(row.subscription_ends_at).getTime()).toBeGreaterThan(Date.now());
   });
 });
+
+describe('₹0 plans', () => {
+  it('the onboarding options include a ₹0 plan, and it never shows in the distributor renewal list', async () => {
+    const ap = String(8400000000 + Math.floor(Math.random() * 99999));
+    await exec(pool, "INSERT INTO users (role, phone, name, password_hash) VALUES ('admin',?,?,?)", [ap, 'Admin', await bcrypt.hash('password123', 4)]);
+    const admin = (await request(app).post('/api/v1/auth/login').send({ phone: ap, password: 'password123' }).expect(200)).body.access_token as string;
+    const sp = String(8500000000 + Math.floor(Math.random() * 99999));
+    await request(app).post('/api/v1/admin/staff').set(auth(admin)).send({ phone: sp, name: 'Emp', password: 'password123', email: `e${sp}@test.local`, actions: ['create_distributors'], grantable: [] }).expect(201);
+    const emp = (await request(app).post('/api/v1/auth/login').send({ phone: sp, password: 'password123' }).expect(200)).body.access_token as string;
+    const meta = (await request(app).get('/api/v1/staff/onboarding/meta').set(auth(emp)).expect(200)).body;
+    expect(meta.plans.some((p: any) => p.price === '0.00')).toBe(true);
+    expect(meta.free_plan_ids.length).toBeGreaterThan(0);
+    // an admin can also add a ₹0 plan by hand
+    await request(app).post('/api/v1/admin/plans').set(auth(admin)).send({ name: 'Zero test', days: 10, price: '0' }).expect(201);
+  });
+});

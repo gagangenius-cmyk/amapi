@@ -37,7 +37,7 @@ subscriptionRouter.get('/', asyncHandler(async (req, res) => {
   const d = req.auth!.userId;
   const [state, plans, company, pending, history] = await Promise.all([
     subscriptionState(d),
-    q<any>(pool, 'SELECT id, name, days, price_paise, description FROM subscription_plans WHERE is_active = 1 ORDER BY sort_order, days'),
+    q<any>(pool, 'SELECT id, name, days, price_paise, description FROM subscription_plans WHERE is_active = 1 AND price_paise > 0 ORDER BY sort_order, days'),
     companyPayment(),
     q1<any>(pool, "SELECT * FROM subscription_payments WHERE distributor_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1", [d]),
     q<any>(pool, 'SELECT * FROM subscription_payments WHERE distributor_id = ? ORDER BY id DESC LIMIT 10', [d]),
@@ -62,7 +62,7 @@ subscriptionRouter.post('/checkout', asyncHandler(async (req, res) => {
   const dup = await q1<any>(pool, 'SELECT * FROM subscription_payments WHERE distributor_id = ? AND idempotency_key = ?', [d, key]);
   if (dup) return void res.status(200).json({ replayed: true, payment: presentPayment(dup), checkout_url: dup.checkout_url });
 
-  const plan = await q1<any>(pool, 'SELECT * FROM subscription_plans WHERE id = ? AND is_active = 1', [b.plan_id]);
+  const plan = await q1<any>(pool, 'SELECT * FROM subscription_plans WHERE id = ? AND is_active = 1 AND price_paise > 0', [b.plan_id]);
   if (!plan) throw new AppError(404, 'NOT_FOUND', 'That plan is not available');
 
   if (b.method === 'upi') {

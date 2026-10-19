@@ -65,7 +65,10 @@ describe('plans and the timer', () => {
     const d = await dist(); await setCompany();
     const plan = (await request(app).post('/api/v1/admin/plans').set(auth(admin)).send({ name: 'Half-year', days: 180, price: '4999', sort_order: 5 }).expect(201)).body;
     expect(plan.price).toBe('4999.00');
-    expect((await request(app).post('/api/v1/admin/plans').set(auth(admin)).send({ name: 'Free', days: 30, price: '0' })).status).toBe(400);
+    expect((await request(app).post('/api/v1/admin/plans').set(auth(admin)).send({ name: 'Negative', days: 30, price: '-5' })).status).toBe(400);
+    // a ₹0 plan is allowed (testing onboarding) but is never offered for self-service renewal
+    const free = (await request(app).post('/api/v1/admin/plans').set(auth(admin)).send({ name: 'Free', days: 30, price: '0' }).expect(201)).body;
+    expect((await request(app).get('/api/v1/subscription').set(auth(d.token)).expect(200)).body.plans.some((x: any) => x.id === free.id)).toBe(false);
     const pay = (await checkout(d, { plan_id: plan.id, method: 'upi', utr: 'UTRSUBHALF01' }).expect(201)).body.payment;
     await request(app).put(`/api/v1/admin/plans/${plan.id}`).set(auth(admin)).send({ price: '9999', days: 90 }).expect(200);          // price and length change later
     const before = await ends(d);
