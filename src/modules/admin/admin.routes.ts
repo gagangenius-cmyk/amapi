@@ -110,6 +110,79 @@ adminRouter.post('/users/:id/status', asyncHandler(async (req, res) => {
   res.json({ id, is_active });
 }));
 
+// ---- edit anyone below the admin: company employee, distributor, distributor employee, retailer ----
+const EDITABLE_ROLES = ['company_employee', 'distributor', 'employee', 'retailer'];
+const profileSelect = `SELECT u.id, u.role, u.name, u.phone, u.email, u.is_active, u.owner_distributor_id,
+    dp.business_name, dp.gst_no dist_gst, dp.address dist_address, dp.city dist_city, dp.pincode dist_pincode,
+    rp.shop_name, rp.gst_no ret_gst, rp.address ret_address, rp.pincode ret_pincode,
+    od.name owner_name
+  FROM users u LEFT JOIN distributor_profiles dp ON dp.user_id = u.id LEFT JOIN retailer_profiles rp ON rp.user_id = u.id
+  LEFT JOIN users od ON od.id = u.owner_distributor_id WHERE u.id = ?`;
+const presentProfile = (r: any) => ({
+  id: r.id, role: r.role, name: r.name, phone: r.phone, email: r.email, is_active: !!r.is_active, works_for: r.owner_name ?? null,
+  ...(r.role === 'distributor' && { business_name: r.business_name, gst_no: r.dist_gst, address: r.dist_address, city: r.dist_city, pincode: r.dist_pincode }),
+  ...(r.role === 'retailer' && { shop_name: r.shop_name, gst_no: r.ret_gst, address: r.ret_address, pincode: r.ret_pincode }),
+});
+
+adminRouter.get('/users/:id/profile', asyncHandler(async (req, res) => {
+  const r = await q1<any>(pool, profileSelect, [idParam(req)]);
+  if (!r || !EDITABLE_ROLES.includes(r.role)) throw new AppError(404, 'NOT_FOUND', 'User not found');
+  res.json(presentProfile(r));
+}));
+
+adminRouter.put('/users/:id/profile', asyncHandler(async (req, res) => {
+  const b = z.object({
+    name: z.string().trim().min(2).max(120).optional(),
+    phone: z.string().regex(/^\d{10}$/, '10-digit phone').optional(),
+    email: z.string().trim().toLowerCase().email().max(190).nullable().optional(),
+    business_name: z.string().trim().min(2).max(190).optional(),
+    shop_name: z.string().trim().min(2).max(190).optional(),
+    gst_no: z.string().trim().toUpperCase().regex(/^\d{2}[A-Z0-9]{13}$/, 'GSTIN must be 15 characters').nullable().optional(),
+    address: z.string().trim().min(3).max(255).nullable().optional(),
+    city: z.string().trim().min(2).max(100).nullable().optional(),
+    pincode: z.string().regex(/^\d{6}$/, 'Pincode is 6 digits').optional(),
+    password: z.string().min(8).max(100).optional(), // a NEW password: existing ones are one-way hashes and can never be read back
+  }).refine((v) => Object.keys(v).length > 0, 'Nothing to change').parse(req.body);
+  const id = idParam(req);
+  const cur = await q1<any>(pool, profileSelect, [id]);
+  if (!cur || !EDITABLE_ROLES.includes(cur.role)) throw new AppError(404, 'NOT_FOUND', cur ? 'Admin accounts are managed outside the console' : 'User not found');
+  if (cur.role !== 'distributor' && (b.business_name !== undefined || b.city !== undefined)) throw new AppError(400, 'NOT_APPLICABLE', 'Business name and city apply to distributors only');
+  if (cur.role !== 'retailer' && b.shop_name !== undefined) throw new AppError(400, 'NOT_APPLICABLE', 'Shop name applies to retailers only');
+  if (cur.role !== 'distributor' && cur.role !== 'retailer' && (b.gst_no !== undefined || b.address !== undefined || b.pincode !== undefined)) {
+    throw new AppError(400, 'NOT_APPLICABLE', 'GST, address and pincode apply to distributors and retailers only');
+  }
+  try {
+    await withTx(async (c) => {
+      if (b.phone !== undefined && b.phone !== cur.phone && (await q1(c, 'SELECT id FROM users WHERE phone = ? AND id <> ?', [b.phone, id]))) throw new AppError(409, 'PHONE_TAKEN', 'Phone already registered');
+      if (b.email && b.email !== cur.email) {
+        await exec(c, 'UPDATE users SET email = NULL WHERE email = ? AND email_verified_at IS NULL AND id <> ?', [b.email, id]);
+        if (await q1(c, 'SELECT id FROM users WHERE email = ? AND id <> ?', [b.email, id])) throw new AppError(409, 'EMAIL_TAKEN', 'Email already registered');
+      }
+      const emailChanged = b.email !== undefined && b.email !== cur.email;
+      await exec(c, `UPDATE users SET name = COALESCE(?, name), phone = COALESCE(?, phone), email = IF(?, ?, email), email_verified_at = IF(?, NULL, email_verified_at),
+        password_hash = COALESCE(?, password_hash) WHERE id = ?`, [
+        b.name ?? null, b.phone ?? null, emailChanged ? 1 : 0, b.email ?? null, emailChanged ? 1 : 0, b.password ? await bcrypt.hash(b.password, 10) : null, id,
+      ]);
+      // a new password ends the person's sessions everywhere
+      if (b.password) await exec(c, 'UPDATE refresh_tokens SET revoked_at = UTC_TIMESTAMP() WHERE user_id = ? AND revoked_at IS NULL', [id]);
+      if (cur.role === 'distributor') {
+        await exec(c, `UPDATE distributor_profiles SET business_name = COALESCE(?, business_name), gst_no = IF(?, ?, gst_no), address = IF(?, ?, address),
+          city = IF(?, ?, city), pincode = COALESCE(?, pincode) WHERE user_id = ?`, [
+          b.business_name ?? null, b.gst_no !== undefined ? 1 : 0, b.gst_no ?? null, b.address !== undefined ? 1 : 0, b.address ?? null,
+          b.city !== undefined ? 1 : 0, b.city ?? null, b.pincode ?? null, id,
+        ]);
+      } else if (cur.role === 'retailer') {
+        await exec(c, `UPDATE retailer_profiles SET shop_name = COALESCE(?, shop_name), gst_no = IF(?, ?, gst_no), address = IF(?, ?, address), pincode = COALESCE(?, pincode) WHERE user_id = ?`, [
+          b.shop_name ?? null, b.gst_no !== undefined ? 1 : 0, b.gst_no ?? null, b.address !== undefined ? 1 : 0, b.address ?? null, b.pincode ?? null, id,
+        ]);
+      }
+    });
+  } catch (e) { return dupToConflict(e); }
+  invalidateUser(id);
+  await audit(req.auth!.userId, 'admin.user_profile_edit', 'user', id, { fields: Object.keys(b).map((k) => (k === 'password' ? 'password (changed)' : k)) });
+  res.json(presentProfile((await q1<any>(pool, profileSelect, [id]))));
+}));
+
 // ---------------------------------------------------------------------------------------------
 // Company employees: the admin creates them and decides what each may do and which
 // distributor feature switches they may hand out.
