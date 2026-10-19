@@ -2,6 +2,7 @@ import bcrypt from 'bcryptjs';
 import { Request, Response, Router } from 'express';
 import { z } from 'zod';
 import { exec, pool, q, q1, withTx } from '../../db/pool';
+import { env } from '../../config/env';
 import { idempotencyKey, requireRole } from '../../middleware/auth';
 import { getGateway } from '../../services/gateway';
 import { notifyUsers } from '../../services/notify';
@@ -42,8 +43,9 @@ staffOnboardingRouter.get('/meta', requireStaffAction('create_distributors'), as
     companyPayment(),
   ]);
   res.json({
-    plans: plans.map((x) => ({ id: x.id, name: x.name, days: x.days, price: fromPaise(Number(x.price_paise)), description: x.description })),
+    plans: plans.map((x) => ({ id: x.id, name: x.name, days: x.days, price: env.freeOnboarding ? '0.00' : fromPaise(Number(x.price_paise)), description: x.description })),
     categories, grant_catalog: grantCatalog(p.grantable),
+    free_mode: env.freeOnboarding,
     pay_by_upi: !!company.upi_id, pay_by_gateway: !!getGateway(),
     reviews_products: p.actions.includes('review_products'),
   });
@@ -62,9 +64,10 @@ staffOnboardingRouter.post('/', requireStaffAction('create_distributors'), async
   const permissions = resolvePermissions(b.permissions, perms.grantable, null);
   const categories = await validateCategoryChoice(pool, b.category_ids);
   const company = await companyPayment();
-  if (b.method === 'upi' && !company.upi_id) throw new AppError(501, 'NO_COMPANY_UPI', 'The company UPI id is not set up yet. Ask the admin to add it.');
-  const gw = b.method === 'gateway' ? getGateway() : null;
-  if (b.method === 'gateway' && !gw) throw new AppError(501, 'GATEWAY_NOT_CONFIGURED', 'Online payment links are not available. Use UPI.');
+  const free = env.freeOnboarding; // testing period: no fee, no payment step
+  if (!free && b.method === 'upi' && !company.upi_id) throw new AppError(501, 'NO_COMPANY_UPI', 'The company UPI id is not set up yet. Ask the admin to add it.');
+  const gw = !free && b.method === 'gateway' ? getGateway() : null;
+  if (!free && b.method === 'gateway' && !gw) throw new AppError(501, 'GATEWAY_NOT_CONFIGURED', 'Online payment links are not available. Use UPI.');
 
   await assertIdentityFree(pool, b.phone, b.email);
   const open = await q1(pool, "SELECT id FROM onboarding_requests WHERE phone = ? AND status IN ('awaiting_payment','payment_submitted')", [b.phone]);
@@ -77,7 +80,7 @@ staffOnboardingRouter.post('/', requireStaffAction('create_distributors'), async
     const r = await exec(pool, `INSERT INTO onboarding_requests (created_by, phone, email, owner_name, password_hash, business_name, gst_no, address, city, pincode, permissions, category_ids, review_required,
       plan_id, plan_name, days, amount_paise, method, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [me, b.phone, b.email ?? null, b.name, await bcrypt.hash(b.password, 10), b.business_name, b.gst_no ?? null, b.address ?? null, b.city ?? null, b.pincode ?? null,
-        JSON.stringify(permissions), JSON.stringify(categories), review ? 1 : 0, plan.id, plan.name, plan.days, plan.price_paise, b.method, key]);
+        JSON.stringify(permissions), JSON.stringify(categories), review ? 1 : 0, plan.id, plan.name, plan.days, free ? 0 : plan.price_paise, free ? 'upi' : b.method, key]);
     id = r.insertId;
   } catch (e) { return dupToConflict(e); }
 
@@ -90,7 +93,13 @@ staffOnboardingRouter.post('/', requireStaffAction('create_distributors'), async
       throw new AppError(502, 'GATEWAY_ERROR', 'The payment service did not respond. Nothing was charged. Please try again.', { reason: String(err?.message ?? err).slice(0, 120) });
     }
   }
-  await audit(me, 'onboarding.requested', 'onboarding', id, { business_name: b.business_name, plan: plan.name, method: b.method, amount_paise: Number(plan.price_paise) });
+  await audit(me, 'onboarding.requested', 'onboarding', id, { business_name: b.business_name, plan: plan.name, method: free ? 'free' : b.method, amount_paise: free ? 0 : Number(plan.price_paise) });
+  if (free) {
+    // no fee to wait for: create the distributor now (same path as a confirmed payment, so the plan days, categories and trail are identical)
+    const done = await withTx((c) => completeOnboarding(c, id, { decidedBy: me }));
+    await afterOnboarding(done, me);
+    if (!done.ok) throw new AppError(409, 'ONBOARDING_FAILED', done.reason ?? 'The account could not be created');
+  }
   const row = (await q1<any>(pool, `${SELECT} WHERE o.id = ?`, [id]))!;
   res.status(201).json({ replayed: false, request: presentOnboarding(row, company), checkout_url: row.checkout_url });
 }));

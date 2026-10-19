@@ -51,6 +51,8 @@ export const env = {
   testOtp: (() => { const v = process.env.TEST_OTP ?? '123456'; return isTest || !/^\d{6}$/.test(v) ? null : v; })(),
   /** Accounts (email or phone, comma-separated) for which TEST_OTP also works on the passwordless "sign in with a code" screen. Sign-in only, never password reset. Set TEST_OTP_ACCOUNTS=none to disable. */
   testOtpAccounts: (process.env.TEST_OTP_ACCOUNTS ?? 'sales.subodh@gmail.com,9813094441').split(',').map((x) => x.trim().toLowerCase()).filter((x) => x && x !== 'none'),
+  /** TESTING PERIOD: distributor onboarding is free (fee ₹0, no payment step; the account goes live at once). Default on for now. Set FREE_ONBOARDING=0 to charge the plan fee again. */
+  get freeOnboarding() { return process.env.FREE_ONBOARDING !== '0'; },
   adminRequires2fa:process.env.ADMIN_REQUIRE_2FA ? process.env.ADMIN_REQUIRE_2FA === '1' : isProd,
   uploadDir: process.env.UPLOAD_DIR ?? 'uploads',
   accessTtlMin: Number(process.env.ACCESS_TTL_MIN ?? 15),
