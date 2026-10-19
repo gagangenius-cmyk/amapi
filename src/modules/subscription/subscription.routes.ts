@@ -1,3 +1,4 @@
+import { env } from '../../config/env';
 import { Router } from 'express';
 import { z } from 'zod';
 import { exec, pool, q, q1, withTx } from '../../db/pool';
@@ -26,11 +27,15 @@ const presentPayment = (p: any) => ({
 
 export async function subscriptionState(distributorId: number, now = new Date()) {
   const d = await loadDistributor(pool, distributorId);
+  if (env.freeOnboarding) { // testing period: free and always active
+    const far = new Date(+now + 3650 * 86_400_000);
+    return { plan_name: 'Free (testing)', ends_at: far, now, seconds_left: 3650 * 86400, days_left: 3650, status: 'active' as const, warn_days: WARN_DAYS, free_mode: true };
+  }
   const ends = new Date(d.subscription_ends_at);
   const seconds = Math.floor((+ends - +now) / 1000);
   const days = Math.ceil(seconds / 86400);
   const status = seconds <= 0 ? 'expired' : days <= WARN_DAYS ? 'expiring' : 'active';
-  return { plan_name: d.plan_name ?? (seconds > 0 ? 'Trial' : null), ends_at: ends, now, seconds_left: Math.max(0, seconds), days_left: Math.max(0, days), status, warn_days: WARN_DAYS };
+  return { plan_name: d.plan_name ?? (seconds > 0 ? 'Trial' : null), ends_at: ends, now, seconds_left: Math.max(0, seconds), days_left: Math.max(0, days), status, warn_days: WARN_DAYS, free_mode: false };
 }
 
 subscriptionRouter.get('/', asyncHandler(async (req, res) => {
@@ -44,7 +49,7 @@ subscriptionRouter.get('/', asyncHandler(async (req, res) => {
   ]);
   res.json({
     ...state,
-    plans: plans.map((p) => ({ id: p.id, name: p.name, days: p.days, price: fromPaise(Number(p.price_paise)), description: p.description })),
+    plans: env.freeOnboarding ? [] : plans.map((p) => ({ id: p.id, name: p.name, days: p.days, price: fromPaise(Number(p.price_paise)), description: p.description })),
     pay_by_upi: company.upi_id ? { upi_id: company.upi_id, payee: company.payee } : null,
     pay_by_gateway: !!getGateway(),
     pending: pending ? presentPayment(pending) : null,

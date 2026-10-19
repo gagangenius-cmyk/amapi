@@ -1,3 +1,4 @@
+import { env } from '../../config/env';
 import { Router } from 'express';
 import { z } from 'zod';
 import { exec, pool, q, q1 } from '../../db/pool';
@@ -107,8 +108,8 @@ announcementRouter.get('/', requireRole('distributor', 'retailer'), asyncHandler
       EXISTS (SELECT 1 FROM retailer_distributor_relations r WHERE r.retailer_id = ? AND r.distributor_id = a.distributor_id AND r.status = 'active') AS is_linked,
       EXISTS (SELECT 1 FROM service_pincodes sp WHERE sp.distributor_id = a.distributor_id AND sp.pincode = ?) AS sells_here
     FROM announcements a JOIN distributor_profiles dp ON dp.user_id = a.distributor_id LEFT JOIN products p ON p.id = a.product_id
-    WHERE a.created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL 60 DAY) AND (a.valid_until IS NULL OR a.valid_until >= UTC_DATE()) AND dp.subscription_ends_at > UTC_TIMESTAMP()
-    ORDER BY a.id DESC LIMIT 200`, [a.userId, me.pincode]);
+    WHERE a.created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL 60 DAY) AND (a.valid_until IS NULL OR a.valid_until >= UTC_DATE()) AND (? OR dp.subscription_ends_at > UTC_TIMESTAMP())
+    ORDER BY a.id DESC LIMIT 200`, [a.userId, me.pincode, env.freeOnboarding ? 1 : 0]);
   const seen = me.offers_seen_at ? +new Date(me.offers_seen_at) : 0;
   const mine = rows.filter((r) => {
     if (r.is_linked) {

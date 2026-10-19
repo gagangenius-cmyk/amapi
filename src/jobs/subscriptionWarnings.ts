@@ -1,3 +1,4 @@
+import { env } from '../config/env';
 import cron from 'node-cron';
 import { exec, lockName, pool, q } from '../db/pool';
 import { logger } from '../utils/logger';
@@ -9,6 +10,7 @@ import { receivablesOf, sendReminder } from '../modules/collections/collections.
  * runs); when the subscription ends they are told once that it has ended. Paying resets the counter (expiry_warned_at = NULL).
  */
 export async function runExpiryWarnings(days = 5) {
+  if (env.freeOnboarding) return []; // free testing period: nobody is told a subscription is ending
   const soon = await q<any>(pool, `
     SELECT user_id, subscription_ends_at FROM distributor_profiles
     WHERE subscription_ends_at > UTC_TIMESTAMP() AND subscription_ends_at <= DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? DAY)
@@ -37,7 +39,7 @@ export async function runExpiryWarnings(days = 5) {
  * khatabook on are included only when something is overdue by at least a day. One reminder per pair per 24 h at most.
  */
 export async function runOverdueReminders(now = new Date()) {
-  const dists = await q<any>(pool, "SELECT user_id, business_name, permissions FROM distributor_profiles WHERE subscription_ends_at > UTC_TIMESTAMP()");
+  const dists = await q<any>(pool, "SELECT user_id, business_name, permissions FROM distributor_profiles WHERE (? OR subscription_ends_at > UTC_TIMESTAMP())", [env.freeOnboarding ? 1 : 0]);
   let sent = 0;
   for (const d of dists) {
     if (JSON.parse(d.permissions).khatabook_enabled === false) continue;

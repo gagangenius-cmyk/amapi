@@ -1,3 +1,4 @@
+import { env } from '../../config/env';
 import { Conn, q1 } from '../../db/pool';
 import { AppError, forbidden } from '../../utils/errors';
 
@@ -39,7 +40,8 @@ export async function loadDistributor(c: Conn, distributorId: number) {
 /** Throws unless the distributor's subscription is live. Call on every distributor-side write. */
 export async function assertSubscriptionActive(c: Conn, distributorId: number) {
   const d = await loadDistributor(c, distributorId);
-  if (new Date(d.subscription_ends_at).getTime() < Date.now())
+  // testing period (FREE_ONBOARDING): subscriptions are free and never block anything
+  if (!env.freeOnboarding && new Date(d.subscription_ends_at).getTime() < Date.now())
     throw new AppError(402, 'SUBSCRIPTION_EXPIRED', 'Distributor subscription has expired');
   return d;
 }
