@@ -21,6 +21,7 @@ import { chatRouter } from './modules/chat/chat.routes';
 import { deviceRouter } from './modules/devices/devices.routes';
 import { docsRouter } from './modules/docs/docs.routes';
 import { paymentRouter } from './modules/payments/payments.routes';
+import { fieldRouter } from './modules/field/field.routes';
 import { paymentWebhookRouter } from './modules/payments/payments.webhook';
 import { complianceRouter } from './modules/compliance/compliance.routes';
 import { announcementRouter } from './modules/announcements/announcements.routes';
@@ -111,6 +112,7 @@ export function createApp() {
   app.use('/api/v1/pricing', pricingRouter);
   app.use('/api/v1/commission', distributorCommissionRouter);
   app.use('/api/v1/support', supportRouter);
+  app.use('/api/v1/field', fieldRouter);
   if (!env.isProd || process.env.ENABLE_DOCS === '1') app.use(docsRouter); // API docs are not published by default in production
 
   app.use((_req, res) => res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Route not found' } }));

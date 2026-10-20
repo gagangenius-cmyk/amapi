@@ -537,6 +537,7 @@ const importRow = z.object({
   hsn: z.string().trim().regex(/^\d{4,8}$/, 'HSN is 4 to 8 digits').optional().or(z.literal('').transform(() => undefined)),
   min_order_qty: z.coerce.number().int().min(1).optional(),
   low_stock_threshold: z.coerce.number().int().min(0).optional(),
+  barcode: z.string().trim().regex(/^[A-Za-z0-9-]{4,40}$/, 'Barcode is 4 to 40 letters, digits or dashes').optional().or(z.literal('').transform(() => undefined)),
 });
 
 // Add many products at once (rows come from a spreadsheet/CSV). Valid rows are saved; invalid ones are reported by row number.
@@ -578,16 +579,16 @@ catalogRouter.post('/import/rows', ...writer, asyncHandler(async (req, res) => {
       const existing = r.sku && b.upsert ? await q1<any>(c, 'SELECT * FROM products WHERE distributor_id = ? AND sku = ? AND deleted_at IS NULL FOR UPDATE', [d, r.sku]) : undefined;
       try {
         if (existing) {
-          await exec(c, `UPDATE products SET name=?, category=?, brand=?, unit=?, description=?, price_paise=?, mrp_paise=?, hsn=?, gst_rate_bps=?, min_order_qty=?, low_stock_threshold=? WHERE id=?`, [
-            r.name, r.category ?? existing.category, r.brand ?? existing.brand, r.unit || existing.unit, r.description ?? existing.description, price, mrp ?? existing.mrp_paise,
+          await exec(c, `UPDATE products SET name=?, barcode=?, category=?, brand=?, unit=?, description=?, price_paise=?, mrp_paise=?, hsn=?, gst_rate_bps=?, min_order_qty=?, low_stock_threshold=? WHERE id=?`, [
+            r.name, r.barcode ?? existing.barcode, r.category ?? existing.category, r.brand ?? existing.brand, r.unit || existing.unit, r.description ?? existing.description, price, mrp ?? existing.mrp_paise,
             r.hsn ?? existing.hsn, r.gst === undefined ? existing.gst_rate_bps : gstBps, r.min_order_qty ?? existing.min_order_qty, r.low_stock_threshold ?? existing.low_stock_threshold, existing.id]);
           await recordPrice(c, existing.id, Number(existing.price_paise), price, d);
           if (r.stock !== undefined && r.stock !== existing.stock_qty) await changeStock(c, { productId: existing.id, distributorId: d, delta: r.stock - existing.stock_qty, reason: 'import', actorId: d });
           await syncProduct(c, existing.id, d, 'import_update');
           updated++;
         } else {
-          const ins = await exec(c, `INSERT INTO products (distributor_id, name, sku, category, brand, unit, description, price_paise, mrp_paise, stock_qty, min_order_qty, low_stock_threshold, hsn, gst_rate_bps, is_active)
-            VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,1)`, [d, r.name, r.sku ?? null, r.category ?? null, r.brand ?? null, r.unit || 'pcs', r.description ?? null, price, mrp, r.min_order_qty ?? 1, r.low_stock_threshold ?? 10, r.hsn ?? null, gstBps]);
+          const ins = await exec(c, `INSERT INTO products (distributor_id, name, sku, barcode, category, brand, unit, description, price_paise, mrp_paise, stock_qty, min_order_qty, low_stock_threshold, hsn, gst_rate_bps, is_active)
+            VALUES (?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,1)`, [d, r.name, r.sku ?? null, r.barcode ?? null, r.category ?? null, r.brand ?? null, r.unit || 'pcs', r.description ?? null, price, mrp, r.min_order_qty ?? 1, r.low_stock_threshold ?? 10, r.hsn ?? null, gstBps]);
           await recordPrice(c, ins.insertId, null, price, d);
           if (r.stock) await changeStock(c, { productId: ins.insertId, distributorId: d, delta: r.stock, reason: 'import', actorId: d });
           await syncProduct(c, ins.insertId, d, 'import_create');
@@ -595,6 +596,7 @@ catalogRouter.post('/import/rows', ...writer, asyncHandler(async (req, res) => {
         }
       } catch (e: any) {
         if (e?.code === 'ER_DUP_ENTRY' && String(e.message).includes('uq_prod_sku')) { errors.push({ row: n, message: `sku: "${r.sku}" already exists (turn on update-by-SKU to change it)` }); continue; }
+        if (e?.code === 'ER_DUP_ENTRY' && String(e.message).includes('uq_prod_barcode')) { errors.push({ row: n, message: `barcode: "${r.barcode}" is already used by another product` }); continue; }
         throw e;
       }
     }
