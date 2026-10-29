@@ -270,22 +270,48 @@ catalogRouter.get('/:id/audience', requireRole('distributor', 'employee'), async
   if (!(await q1(pool, 'SELECT 1 FROM products WHERE id = ? AND distributor_id = ? AND deleted_at IS NULL', [id, req.auth!.distributorId]))) throw notFound('Product');
   res.json({ retailers: await q(pool, 'SELECT u.id, rp.shop_name FROM product_audience pa JOIN users u ON u.id = pa.retailer_id JOIN retailer_profiles rp ON rp.user_id = u.id WHERE pa.product_id = ? ORDER BY rp.shop_name', [id]) });
 }));
-catalogRouter.put('/:id/audience', ...writer, asyncHandler(async (req, res) => {
-  const { retailer_ids } = z.object({ retailer_ids: z.array(z.number().int().positive()).max(2000) }).parse(req.body);
-  const id = idParam(req); const d = req.auth!.userId;
+/**
+ * Who may see a product. Three ways to say it (an empty result opens the product to everyone again):
+ *  - retailer_ids: hand-picked retailers
+ *  - pincodes:     every connected retailer in those pincodes (resolved now; retailers added later are not included automatically)
+ *  - mine:         every retailer this employee manages (employee only)
+ * A distributor employee can only narrow to retailers they manage themselves: they never see or touch anyone else's.
+ */
+catalogRouter.put('/:id/audience', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
+  const b = z.object({
+    retailer_ids: z.array(z.number().int().positive()).max(2000).optional(),
+    pincodes: z.array(z.string().regex(/^\d{6}$/)).max(100).optional(),
+    mine: z.boolean().optional(),
+  }).refine((v) => v.retailer_ids || v.pincodes || v.mine !== undefined, 'Say who can see this product').parse(req.body);
+  const id = idParam(req); const a = req.auth!; const d = a.distributorId!;
+  const isEmployee = a.role === 'employee';
+  if (b.mine && !isEmployee) throw new AppError(400, 'VALIDATION', '"mine" is for distributor employees');
   if (!(await q1(pool, 'SELECT 1 FROM products WHERE id = ? AND distributor_id = ? AND deleted_at IS NULL', [id, d]))) throw notFound('Product');
-  const ids = [...new Set(retailer_ids)];
-  if (ids.length) {
-    const ok = await q<any>(pool, "SELECT retailer_id FROM retailer_distributor_relations WHERE distributor_id = ? AND status = 'active' AND retailer_id IN (?)", [d, ids]);
-    const bad = ids.filter((x) => !ok.some((o) => o.retailer_id === x));
-    if (bad.length) throw new AppError(400, 'NOT_YOUR_RETAILER', `Not one of your retailers: ${bad.join(', ')}`);
+  await assertSubscriptionActive(pool, d);
+
+  // retailers this caller is allowed to name: all of the distributor's, or (employee) only the ones they manage
+  const scope = isEmployee ? ' AND u.managed_by_id = ?' : '';
+  const scopeArgs = isEmployee ? [a.userId] : [];
+  const allowed = await q<any>(pool, `SELECT r.retailer_id id, rp.pincode FROM retailer_distributor_relations r JOIN users u ON u.id = r.retailer_id JOIN retailer_profiles rp ON rp.user_id = r.retailer_id
+    WHERE r.distributor_id = ? AND r.status = 'active'${scope}`, [d, ...scopeArgs]);
+  const ids = new Set<number>();
+  for (const r of b.retailer_ids ?? []) ids.add(r);
+  if (b.pincodes?.length) for (const r of allowed) if (b.pincodes.includes(r.pincode)) ids.add(r.id);
+  if (b.mine) for (const r of allowed) ids.add(r.id);
+  const bad = [...ids].filter((x) => !allowed.some((o) => o.id === x));
+  if (bad.length) throw new AppError(400, 'NOT_YOUR_RETAILER', isEmployee ? 'You can only choose retailers you manage' : `Not one of your retailers: ${bad.join(', ')}`);
+  // an employee narrowing a product must not strip other retailers' access silently: they may only change the audience while it is open or already limited to their own retailers
+  if (isEmployee) {
+    const existing = await q<any>(pool, 'SELECT pa.retailer_id, u.managed_by_id FROM product_audience pa JOIN users u ON u.id = pa.retailer_id WHERE pa.product_id = ?', [id]);
+    if (existing.some((e) => e.managed_by_id !== a.userId)) throw new AppError(403, 'FORBIDDEN', 'This product is limited to retailers who are not yours. Ask the distributor to change it.');
   }
+  const list = [...ids];
   await withTx(async (c) => {
     await exec(c, 'DELETE FROM product_audience WHERE product_id = ?', [id]);
-    if (ids.length) await exec(c, 'INSERT INTO product_audience (product_id, retailer_id) VALUES ?', [ids.map((r) => [id, r])]);
+    if (list.length) await exec(c, 'INSERT INTO product_audience (product_id, retailer_id) VALUES ?', [list.map((r) => [id, r])]);
   });
-  await audit(d, 'catalog.audience', 'product', id, { retailers: ids.length });
-  res.json({ product_id: id, private: ids.length > 0, retailers: ids.length });
+  await audit(a.userId, 'catalog.audience', 'product', id, { retailers: list.length, pincodes: b.pincodes ?? null, mine: !!b.mine });
+  res.json({ product_id: id, private: list.length > 0, retailers: list.length });
 }));
 
 catalogRouter.get('/:id/versions', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {

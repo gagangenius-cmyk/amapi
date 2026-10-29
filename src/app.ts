@@ -34,6 +34,7 @@ import { distributorRouter } from './modules/distributors/distributors.routes';
 import { ledgerRouter } from './modules/ledger/ledger.routes';
 import { orderRouter } from './modules/orders/orders.routes';
 import { retailerRouter } from './modules/retailers/retailers.routes';
+import { legalRouter } from './modules/legal/legal.routes';
 import { errorHandler } from './utils/errors';
 import { logger } from './utils/logger';
 import { pool } from './db/pool';
@@ -86,6 +87,9 @@ export function createApp() {
   // Web admin console (static files; the API enforces who may do what).
   const publicDir = [path.join(__dirname, '..', 'public'), path.join(__dirname, '..', '..', 'public')].find((d) => fs.existsSync(d));
   if (publicDir) app.use('/admin-console', express.static(path.join(publicDir, 'admin'), { maxAge: env.isProd ? '1h' : 0 }));
+
+  // public pages required by app stores (no login): privacy policy and account-deletion instructions
+  app.use(legalRouter);
 
   app.use('/api/v1/auth', authRouter);
   app.use('/api/v1/distributor', distributorRouter);
