@@ -34,4 +34,14 @@ describe('barcode lookup', () => {
 
     expect((await info(d1, 'NOPE-12345').expect(200)).body.source).toBe('none');
   });
+
+  it('only imports photos from the public product databases', async () => {
+    const d = await dist();
+    const pid = (await request(app).post('/api/v1/catalog').set(auth(d)).send({ name: 'Plain', price: '10', stock_qty: 1 }).expect(201)).body.id;
+    const imp = (url: string) => request(app).post(`/api/v1/catalog/${pid}/images/import`).set(auth(d)).send({ url });
+    expect((await imp('https://evil.example.com/a.jpg')).status).toBe(400);
+    expect((await imp('http://images.openfoodfacts.org/a.jpg')).status).toBe(400);
+    expect((await imp('https://169.254.169.254/latest/meta-data')).status).toBe(400);
+    expect((await imp('https://openfoodfacts.org.evil.com/a.jpg')).status).toBe(400);
+  });
 });

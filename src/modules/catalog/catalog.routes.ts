@@ -235,6 +235,38 @@ catalogRouter.get('/lookup', requireRole('distributor', 'employee'), asyncHandle
   res.json((await presentProducts(pool, [p]))[0]);
 }));
 
+
+// Public product databases (free, no key): Open Food Facts and its sister sites for beauty and general products, then UPCitemdb.
+const OFF_HOSTS = ['world.openfoodfacts.org', 'world.openbeautyfacts.org', 'world.openproductsfacts.org'];
+const IMAGE_HOSTS = ['openfoodfacts.org', 'openbeautyfacts.org', 'openproductsfacts.org'];
+const firstOf = (v: unknown) => String(v ?? '').split(',')[0].trim();
+const getJson = async (url: string) => {
+  const r = await fetch(url, { signal: AbortSignal.timeout(3500), headers: { 'User-Agent': 'AAYME-B2B/1.0 (barcode lookup)', Accept: 'application/json' } });
+  return r.ok ? ((await r.json()) as any) : null;
+};
+async function lookupOnline(barcode: string): Promise<{ source: string; suggestion: Record<string, unknown> } | null> {
+  for (const host of OFF_HOSTS) {
+    try {
+      const j = await getJson(`https://${host}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=product_name,brands,quantity,categories,generic_name,image_front_url`);
+      const p = j?.status === 1 ? j.product : null;
+      if (p?.product_name) {
+        const brand = firstOf(p.brands);
+        return { source: host.split('.')[1], suggestion: {
+          name: [brand, String(p.product_name).trim(), String(p.quantity ?? '').trim()].filter(Boolean).join(' ').slice(0, 190), brand: brand || null,
+          category: firstOf(p.categories) || null, description: String(p.generic_name ?? '').trim().slice(0, 500) || null, image_url: typeof p.image_front_url === 'string' ? p.image_front_url : null,
+        } };
+      }
+    } catch { /* try the next source */ }
+  }
+  try {
+    const j = await getJson(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(barcode)}`);
+    const p = j?.items?.[0];
+    if (p?.title) return { source: 'upcitemdb', suggestion: { name: String(p.title).slice(0, 190), brand: String(p.brand ?? '').trim() || null, category: firstOf(String(p.category ?? '').split('>').pop()) || null,
+      description: String(p.description ?? '').trim().slice(0, 500) || null, image_url: null } };
+  } catch { /* no suggestion */ }
+  return null;
+}
+
 /**
  * Details for a scanned barcode, so the product form can be filled in. Looked up, in order, in: the distributor's own catalogue,
  * products other distributors list under the same barcode (only product facts: name, brand, category, unit, HSN, GST, MRP; never a
@@ -253,17 +285,8 @@ catalogRouter.get('/barcode-info', requireRole('distributor', 'employee'), async
   }
 
   if (process.env.NODE_ENV !== 'test' && process.env.BARCODE_LOOKUP !== 'off') {
-    try {
-      const r = await fetch(`https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(barcode)}.json?fields=product_name,brands,quantity,categories`, { signal: AbortSignal.timeout(3500), headers: { 'User-Agent': 'AAYME-B2B/1.0 (barcode lookup)' } });
-      const j: any = r.ok ? await r.json() : null;
-      const p = j?.status === 1 ? j.product : null;
-      if (p?.product_name) {
-        const qty = typeof p.quantity === 'string' ? p.quantity.trim() : '';
-        res.json({ source: 'openfoodfacts', suggestion: { name: [String(p.brands ?? '').split(',')[0].trim(), String(p.product_name).trim(), qty].filter(Boolean).join(' ').slice(0, 190),
-          brand: String(p.brands ?? '').split(',')[0].trim() || null, category: String(p.categories ?? '').split(',')[0].trim() || null } });
-        return;
-      }
-    } catch { /* an unreachable lookup service just means no suggestion */ }
+    const found = await lookupOnline(barcode);
+    if (found) { res.json({ source: found.source, suggestion: found.suggestion }); return; }
   }
   res.json({ source: 'none' });
 }));
@@ -474,6 +497,27 @@ catalogRouter.post('/:id/images', ...writer, rawImage, asyncHandler(async (req, 
   const key = crypto.randomBytes(20).toString('hex');
   await storage.put(`${key}.${EXT[mime]}`, req.body, mime);
   await exec(pool, 'INSERT INTO product_images (product_id, distributor_id, file_key, mime, bytes, position) VALUES (?,?,?,?,?,?)', [id, d, key, mime, req.body.length, Number(n)]);
+  res.status(201).json({ images: await imagesOf(id) });
+}));
+
+// Add a photo that a barcode lookup found. Only the public product databases are fetched (never an address the caller invents beyond that list).
+catalogRouter.post('/:id/images/import', ...writer, asyncHandler(async (req, res) => {
+  const { url } = z.object({ url: z.string().url().max(500) }).parse(req.body);
+  const u = new URL(url);
+  if (u.protocol !== 'https:' || !IMAGE_HOSTS.some((h) => u.hostname === h || u.hostname.endsWith('.' + h))) throw new AppError(400, 'BAD_IMAGE_URL', 'That photo address is not allowed');
+  const id = idParam(req); const d = req.auth!.userId;
+  await assertSubscriptionActive(pool, d);
+  if (!(await q1(pool, 'SELECT 1 FROM products WHERE id = ? AND distributor_id = ? AND deleted_at IS NULL', [id, d]))) throw notFound('Product');
+  const n = (await q1<any>(pool, 'SELECT COUNT(*) n FROM product_images WHERE product_id = ?', [id]))!.n;
+  if (Number(n) >= MAX_IMAGES) throw new AppError(409, 'TOO_MANY_IMAGES', `A product can have at most ${MAX_IMAGES} photos`);
+  const r = await fetch(u, { signal: AbortSignal.timeout(6000), redirect: 'error' }).catch(() => null);
+  const bytes = r?.ok ? Buffer.from(await r.arrayBuffer()) : null;
+  if (!bytes || !bytes.length || bytes.length > 1.5 * 1024 * 1024) throw new AppError(422, 'IMAGE_UNAVAILABLE', 'The photo could not be fetched (or is larger than 1.5 MB)');
+  const mime = sniffImage(bytes);
+  if (!mime) throw new AppError(415, 'BAD_IMAGE', 'That file is not a valid JPEG, PNG or WebP image');
+  const key = crypto.randomBytes(20).toString('hex');
+  await storage.put(`${key}.${EXT[mime]}`, bytes, mime);
+  await exec(pool, 'INSERT INTO product_images (product_id, distributor_id, file_key, mime, bytes, position) VALUES (?,?,?,?,?,?)', [id, d, key, mime, bytes.length, Number(n)]);
   res.status(201).json({ images: await imagesOf(id) });
 }));
 
