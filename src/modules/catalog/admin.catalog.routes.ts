@@ -48,14 +48,24 @@ function taxonomyRoutes(kind: TaxKind, path: string) {
 
   // Rename, approve (pending -> active) or retire. Renaming also updates the spelling stored on every product that uses it.
   adminCatalogRouter.put(`/${path}/:id`, asyncHandler(async (req, res) => {
-    const b = z.object({ name: nameField.optional(), status: status.optional() }).refine((v) => Object.keys(v).length > 0, 'Nothing to change').parse(req.body);
+    const b = z.object({ name: nameField.optional(), status: status.optional(), ...(kind === 'category' ? { parent_id: z.number().int().positive().nullable().optional() } : {}) }).refine((v) => Object.keys(v).length > 0, 'Nothing to change').parse(req.body) as { name?: string; status?: string; parent_id?: number | null };
     const id = idParam(req);
     const cur = await q1<any>(pool, `SELECT * FROM ${t} WHERE id = ?`, [id]);
     if (!cur) throw new AppError(404, 'NOT_FOUND', `${kind} not found`);
     if (cur.merged_into_id && b.status && b.status !== 'retired') throw new AppError(409, 'MERGED', 'This entry was merged into another one');
+    // moving a category under another (or back to the top): the new parent must exist, and cannot be the category itself or one of its own sub-categories
+    const moving = kind === 'category' && b.parent_id !== undefined;
+    if (moving && b.parent_id) {
+      const all = await q<any>(pool, 'SELECT id, parent_id, status FROM categories');
+      const byId = new Map(all.map((c: any) => [c.id, c]));
+      const parent = byId.get(b.parent_id);
+      if (!parent || parent.status === 'retired') throw new AppError(400, 'BAD_PARENT', 'Parent category not found');
+      for (let n: any = parent, hops = 0; n && hops < 50; n = n.parent_id ? byId.get(n.parent_id) : null, hops++) if (n.id === id) throw new AppError(400, 'BAD_PARENT', 'A category cannot be placed under itself or its own sub-category');
+    }
     try {
       await withTx(async (c) => {
         await exec(c, `UPDATE ${t} SET name = ?, name_key = ?, status = ? WHERE id = ?`, [b.name ?? cur.name, nameKey(b.name ?? cur.name), b.status ?? cur.status, id]);
+        if (moving) await exec(c, 'UPDATE categories SET parent_id = ?, parent_key = ? WHERE id = ?', [b.parent_id ?? null, b.parent_id ?? 0, id]);
         if (b.name && b.name !== cur.name) await exec(c, `UPDATE products SET ${kind} = ? WHERE ${col} = ?`, [b.name, id]);
       });
     } catch (e: any) {
