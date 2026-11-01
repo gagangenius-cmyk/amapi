@@ -235,6 +235,39 @@ catalogRouter.get('/lookup', requireRole('distributor', 'employee'), asyncHandle
   res.json((await presentProducts(pool, [p]))[0]);
 }));
 
+/**
+ * Details for a scanned barcode, so the product form can be filled in. Looked up, in order, in: the distributor's own catalogue,
+ * products other distributors list under the same barcode (only product facts: name, brand, category, unit, HSN, GST, MRP; never a
+ * price, stock or who sells it), and the public Open Food Facts database (food and grocery; skipped when BARCODE_LOOKUP=off).
+ */
+catalogRouter.get('/barcode-info', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
+  const { barcode } = z.object({ barcode: z.string().trim().min(4).max(40) }).parse(req.query);
+  const own = await q1<any>(pool, 'SELECT * FROM products WHERE distributor_id = ? AND barcode = ? AND deleted_at IS NULL ORDER BY id LIMIT 1', [req.auth!.distributorId, barcode]);
+  if (own) { res.json({ source: 'own', existing: (await presentProducts(pool, [own]))[0] }); return; }
+
+  const other = await q1<any>(pool, `SELECT name, brand, category, unit, hsn, gst_rate_bps, mrp_paise, description FROM products
+    WHERE barcode = ? AND distributor_id <> ? AND deleted_at IS NULL AND review_status = 'approved' ORDER BY id DESC LIMIT 1`, [barcode, req.auth!.distributorId]);
+  if (other) {
+    res.json({ source: 'catalog', suggestion: { name: other.name, brand: other.brand, category: other.category, unit: other.unit, hsn: other.hsn, gst_rate_bps: other.gst_rate_bps, mrp: other.mrp_paise == null ? null : fromPaise(Number(other.mrp_paise)), description: other.description } });
+    return;
+  }
+
+  if (process.env.NODE_ENV !== 'test' && process.env.BARCODE_LOOKUP !== 'off') {
+    try {
+      const r = await fetch(`https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(barcode)}.json?fields=product_name,brands,quantity,categories`, { signal: AbortSignal.timeout(3500), headers: { 'User-Agent': 'AAYME-B2B/1.0 (barcode lookup)' } });
+      const j: any = r.ok ? await r.json() : null;
+      const p = j?.status === 1 ? j.product : null;
+      if (p?.product_name) {
+        const qty = typeof p.quantity === 'string' ? p.quantity.trim() : '';
+        res.json({ source: 'openfoodfacts', suggestion: { name: [String(p.brands ?? '').split(',')[0].trim(), String(p.product_name).trim(), qty].filter(Boolean).join(' ').slice(0, 190),
+          brand: String(p.brands ?? '').split(',')[0].trim() || null, category: String(p.categories ?? '').split(',')[0].trim() || null } });
+        return;
+      }
+    } catch { /* an unreachable lookup service just means no suggestion */ }
+  }
+  res.json({ source: 'none' });
+}));
+
 // Batches that are expired or will expire within `days`, with what is left in them.
 catalogRouter.get('/expiring', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
   const { days } = z.object({ days: z.coerce.number().int().min(0).max(365).default(30) }).parse(req.query);

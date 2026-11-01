@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { env } from '../config/env';
+import { exec, pool, q1 } from '../db/pool';
 
 /**
  * File storage behind one small interface (put / read / remove), so product photos live on local disk by default and in any
@@ -26,6 +27,16 @@ export const localStorage_: Storage = {
     try { return await fs.promises.readFile(path.join(root(), key)); } catch (e: any) { if (e?.code === 'ENOENT') return null; throw e; }
   },
   async remove(key) { await fs.promises.rm(path.join(root(), key), { force: true }); },
+};
+
+/** Files in a MySQL table: for a host with no writable disk (a serverless platform) and no bucket configured. */
+export const dbStorage: Storage = {
+  async put(key, data, mime) { await exec(pool, 'INSERT INTO file_blobs (file_key, mime, data) VALUES (?,?,?)', [key, mime, data]); },
+  async read(key) {
+    const r = await q1<{ data: Buffer }>(pool, 'SELECT data FROM file_blobs WHERE file_key = ?', [key]);
+    return r ? Buffer.from(r.data) : null;
+  },
+  async remove(key) { await exec(pool, 'DELETE FROM file_blobs WHERE file_key = ?', [key]); },
 };
 
 /** Minimal slice of the AWS SDK client we use, so tests can plug in a fake. */
@@ -60,6 +71,8 @@ async function build(): Promise<Storage> {
     const client = new sdk.S3Client({ region: process.env.S3_REGION ?? 'auto', ...(process.env.S3_ENDPOINT && { endpoint: process.env.S3_ENDPOINT, forcePathStyle: true }) });
     return s3Storage({ bucket: process.env.S3_BUCKET, client, commands: { Put: sdk.PutObjectCommand, Get: sdk.GetObjectCommand, Delete: sdk.DeleteObjectCommand } });
   }
+  // a serverless host (Vercel) has a read-only disk: keep files in the database unless a bucket was configured
+  if (process.env.STORAGE === 'db' || (process.env.VERCEL && process.env.STORAGE !== 'local')) return dbStorage;
   return localStorage_;
 }
 
