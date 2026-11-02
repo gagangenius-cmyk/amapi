@@ -433,7 +433,7 @@ describe('offers to chosen retailers', () => {
 
 describe('the onboarding employee reviews the distributor\'s products', () => {
   it('products wait for the employee, are hidden from retailers, and appear once approved', async () => {
-    const s = await shop({ review_required: undefined });                          // an employee who can review gets review on by default
+    const s = await shop({ review_required: true });                               // review is opt-in: the employee turns it on
     expect((await request(app).get('/api/v1/distributor/me').set(auth(s.d.token)).expect(200)).body.review_required).toBe(true);
     const R = await retailer(s, [s.cats[0].id]);
     const p = (await request(app).post('/api/v1/catalog').set(auth(s.d.token)).send({ name: 'New Cola', price: '40', stock_qty: 20, category_id: s.cats[0].id })).body;
@@ -451,7 +451,7 @@ describe('the onboarding employee reviews the distributor\'s products', () => {
   });
 
   it('a rejection needs a reason and the distributor sees it; fixing resubmits', async () => {
-    const s = await shop({ review_required: undefined });
+    const s = await shop({ review_required: true });
     const p = (await request(app).post('/api/v1/catalog').set(auth(s.d.token)).send({ name: 'Odd Thing', price: '9', stock_qty: 5, category_id: s.cats[0].id })).body;
     expect((await request(app).post(`/api/v1/staff/products/${p.id}/review`).set(auth(s.e.token)).send({ action: 'reject' })).body.error.code).toBe('NOTE_REQUIRED');
     await request(app).post(`/api/v1/staff/products/${p.id}/review`).set(auth(s.e.token)).send({ action: 'reject', note: 'Add the HSN code' }).expect(200);
@@ -462,7 +462,7 @@ describe('the onboarding employee reviews the distributor\'s products', () => {
   });
 
   it('only the employee who onboarded the distributor can review its products (or the admin)', async () => {
-    const s = await shop({ review_required: undefined });
+    const s = await shop({ review_required: true });
     const stranger = await employee(s.a);
     const noPower = await employee(s.a, ['create_distributors']);
     const p = (await request(app).post('/api/v1/catalog').set(auth(s.d.token)).send({ name: 'Guarded', price: '9', stock_qty: 5 })).body;
@@ -482,7 +482,7 @@ describe('the onboarding employee reviews the distributor\'s products', () => {
   });
 
   it('the employee can turn review off or on for their distributor', async () => {
-    const s = await shop({ review_required: undefined });
+    const s = await shop({ review_required: true });
     await request(app).put(`/api/v1/staff/distributors/${s.d.id}`).set(auth(s.e.token)).send({ review_required: false }).expect(200);
     expect((await request(app).post('/api/v1/catalog').set(auth(s.d.token)).send({ name: 'Free', price: '9', stock_qty: 5 })).body.review_status).toBe('approved');
     const lim = await employee(s.a, ['create_distributors', 'manage_distributors']);
