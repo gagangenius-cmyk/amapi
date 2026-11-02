@@ -81,7 +81,7 @@ staffOnboardingRouter.post('/', requireStaffAction('create_distributors'), async
   const open = await q1(pool, "SELECT id FROM onboarding_requests WHERE phone = ? AND status IN ('awaiting_payment','payment_submitted')", [b.phone]);
   if (open) throw new AppError(409, 'ONBOARDING_EXISTS', `An onboarding for this phone is already waiting for payment (#${(open as any).id})`);
   // only someone who may review products can have a distributor's products held for review
-  const review = perms.actions.includes('review_products') ? b.review_required ?? true : false;
+  const review = perms.actions.includes('review_products') ? b.review_required ?? false : false;
 
   let id: number;
   try {
