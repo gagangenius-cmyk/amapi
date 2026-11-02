@@ -244,6 +244,13 @@ const getJson = async (url: string) => {
   const r = await fetch(url, { signal: AbortSignal.timeout(3500), headers: { 'User-Agent': 'AAYME-B2B/1.0 (barcode lookup)', Accept: 'application/json' } });
   return r.ok ? ((await r.json()) as any) : null;
 };
+/** Brand + product name + pack size, without repeating the brand when the product name already starts with it. */
+const tidyName = (brand: string, product: string, quantity: string) => {
+  const name = product.trim();
+  const withBrand = brand && !name.toLowerCase().startsWith(brand.toLowerCase()) ? `${brand} ${name}` : name;
+  const size = quantity.trim().replace(/\s+e$/i, '');           // some databases mark an estimated weight with a trailing "e"
+  return [withBrand, size && !withBrand.toLowerCase().includes(size.toLowerCase()) ? size : ''].filter(Boolean).join(' ').slice(0, 190);
+};
 async function lookupOnline(barcode: string): Promise<{ source: string; suggestion: Record<string, unknown> } | null> {
   for (const host of OFF_HOSTS) {
     try {
@@ -252,7 +259,7 @@ async function lookupOnline(barcode: string): Promise<{ source: string; suggesti
       if (p?.product_name) {
         const brand = firstOf(p.brands);
         return { source: host.split('.')[1], suggestion: {
-          name: [brand, String(p.product_name).trim(), String(p.quantity ?? '').trim()].filter(Boolean).join(' ').slice(0, 190), brand: brand || null,
+          name: tidyName(brand, String(p.product_name), String(p.quantity ?? '')), brand: brand || null,
           category: firstOf(p.categories) || null, description: String(p.generic_name ?? '').trim().slice(0, 500) || null, image_url: typeof p.image_front_url === 'string' ? p.image_front_url : null,
         } };
       }
