@@ -23,7 +23,7 @@ const body = z.object({
   email: z.string().trim().toLowerCase().email().max(190).optional(), gst_no: gst.optional(),
   address: z.string().trim().min(3).max(255).optional(), city: z.string().trim().min(2).max(100).optional(), pincode: z.string().regex(/^\d{6}$/, 'Pincode is 6 digits').optional(),
   plan_id: z.number().int().positive(), method: z.enum(['upi', 'gateway']),
-  category_ids: z.array(z.number().int().positive()).min(1, 'Choose at least one category the distributor deals in').max(30),
+  category_ids: z.array(z.number().int().positive()).max(30).default([]),
   permissions: z.record(z.string(), z.boolean()).optional(),
   review_required: z.boolean().optional(),
 });
@@ -67,6 +67,9 @@ staffOnboardingRouter.post('/', requireStaffAction('create_distributors'), async
   const plan = await q1<any>(pool, 'SELECT * FROM subscription_plans WHERE id = ? AND is_active = 1', [b.plan_id]);
   if (!plan) throw new AppError(404, 'NOT_FOUND', 'That plan is not available');
   const permissions = resolvePermissions(b.permissions, perms.grantable, null);
+  // a category is required once the company has any; before that (nobody has created one yet) it cannot block onboarding
+  if (!b.category_ids.length && (await q1<any>(pool, "SELECT 1 x FROM categories WHERE status = 'active' LIMIT 1")))
+    throw new AppError(400, 'VALIDATION', 'Invalid request', { formErrors: [], fieldErrors: { category_ids: ['Choose at least one category the distributor deals in'] } });
   const categories = await validateCategoryChoice(pool, b.category_ids);
   const company = await companyPayment();
   const free = env.freeOnboarding || Number(plan.price_paise) === 0; // testing period (or a ₹0 plan): no fee, no payment step
