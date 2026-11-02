@@ -8,7 +8,7 @@ import { AppError } from '../../utils/errors';
  *   - A retailer with no categories of its own (it signed up itself, or was made before this existed) is not restricted.
  *   - A category covers its sub-categories.
  *   - When the distributor has categories too, only the overlap counts, so narrowing the distributor narrows its retailers.
- *   - A product with no category is hidden from a restricted retailer.
+ *   - A product with no category is open to every retailer (it is not in anyone's excluded categories).
  */
 interface Cat { id: number; parent_id: number | null }
 
@@ -44,7 +44,7 @@ export async function allowedCategoryIds(c: Conn, retailerId: number, distributo
 /** SQL for a product alias, and its arguments. `ids` null adds nothing. */
 export function categoryClause(ids: number[] | null, column = 'category_id'): { sql: string; args: unknown[] } {
   if (ids === null) return { sql: '', args: [] };
-  return ids.length ? { sql: ` AND ${column} IN (?)`, args: [ids] } : { sql: ' AND 1 = 0', args: [] };
+  return ids.length ? { sql: ` AND (${column} IN (?) OR ${column} IS NULL)`, args: [ids] } : { sql: ` AND ${column} IS NULL`, args: [] };
 }
 
 /** Check a list of category ids chosen when creating or editing an account. */

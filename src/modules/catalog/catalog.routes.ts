@@ -71,7 +71,7 @@ export async function storefrontProducts(distributorId: number, opts: { q?: stri
   // a retailer given categories sees (and so can price and order) only products of those; others see everything
   const scopeIds = opts.retailerId ? await allowedCategoryIds(pool, opts.retailerId, distributorId) : null;
   const scope = categoryClause(scopeIds);
-  if (scopeIds !== null) { where.push(scopeIds.length ? 'category_id IN (?)' : '1 = 0'); if (scopeIds.length) args.push(scopeIds); }
+  if (scopeIds !== null) { where.push(scopeIds.length ? '(category_id IN (?) OR category_id IS NULL)' : 'category_id IS NULL'); if (scopeIds.length) args.push(scopeIds); }
   // products kept for chosen retailers are invisible to everyone else
   const own = audienceClause(opts.retailerId);
   where.push(own.sql.replace(/^ AND /, '')); args.push(...own.args);
