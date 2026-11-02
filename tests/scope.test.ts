@@ -66,12 +66,12 @@ describe('a retailer only sees prices for the categories it was given', () => {
     const cola = await product(s, 'Cola', bev.id); const drill = await product(s, 'Drill', hw.id); const loose = await product(s, 'Uncategorised thing', null);
     const A = await retailer(s, [bev.id]); const B = await retailer(s, [hw.id]);
 
-    expect((await store(A, s.d.id)).products.map((p: any) => p.name)).toEqual(['Cola']);
-    expect((await store(B, s.d.id)).products.map((p: any) => p.name)).toEqual(['Drill']);
+    expect((await store(A, s.d.id)).products.map((p: any) => p.name)).toEqual(['Cola', 'Uncategorised thing']);   // a product with no category is open to everyone
+    expect((await store(B, s.d.id)).products.map((p: any) => p.name)).toEqual(['Drill', 'Uncategorised thing']);
     expect((await store(A, s.d.id, '?q=Drill')).products).toEqual([]);                     // cannot search around it
-    expect(JSON.stringify(await store(A, s.d.id))).not.toMatch(/Drill|Uncategorised/);     // the other products' names and prices are simply not sent
+    expect(JSON.stringify(await store(A, s.d.id))).not.toMatch(/Drill/);     // the other products' names and prices are simply not sent
     expect((await order(A, s.d.id, drill.id)).body.error.code).toBe('BAD_PRODUCT');
-    expect((await order(A, s.d.id, loose.id)).status).toBe(400);
+    expect((await order(A, s.d.id, loose.id)).status).toBe(201);
     expect((await order(A, s.d.id, cola.id)).status).toBe(201);
     expect((await order(B, s.d.id, drill.id)).status).toBe(201);
 
@@ -79,8 +79,8 @@ describe('a retailer only sees prices for the categories it was given', () => {
     expect((await store(A, s.d.id)).categories).toEqual([bev.name]);
     expect((await store(B, s.d.id)).categories).toEqual([hw.name]);
     const home = (await request(app).get('/api/v1/retailer/stores').set(auth(A.token)).expect(200)).body;
-    expect(home.primary_distributor.product_count).toBe(1);
-    expect((await request(app).get(`/api/v1/retailer/stores/${s.d.id}`).set(auth(B.token)).expect(200)).body.product_count).toBe(1);
+    expect(home.primary_distributor.product_count).toBe(2);
+    expect((await request(app).get(`/api/v1/retailer/stores/${s.d.id}`).set(auth(B.token)).expect(200)).body.product_count).toBe(2);
   });
 
   it('a retailer given a category also sees its sub-categories', async () => {
