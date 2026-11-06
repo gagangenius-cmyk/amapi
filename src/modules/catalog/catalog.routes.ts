@@ -31,6 +31,11 @@ export function stockStatus(p: { stock_qty: number; low_stock_threshold: number 
 export const displayName = (p: { name: string; variant_label?: string | null }) => (p.variant_label ? `${p.name} · ${p.variant_label}` : p.name);
 
 export const MAX_IMAGES = 5;
+function parseJson<T>(v: unknown, fallback: T): T {
+  if (Array.isArray(v)) return v as T;
+  if (typeof v !== 'string' || !v) return fallback;
+  try { const j = JSON.parse(v); return Array.isArray(j) ? (j as T) : fallback; } catch { return fallback; }
+}
 export const imageUrl = (key: string) => `/api/v1/media/${key}`;
 
 export function presentProduct(p: any, tiers: { min_qty: number; price_paise: number }[] = [], images: { id: number; file_key: string }[] = []) {
@@ -44,6 +49,9 @@ export function presentProduct(p: any, tiers: { min_qty: number; price_paise: nu
     stock_qty: p.stock_qty, stock_status: stockStatus(p), min_order_qty: p.min_order_qty, low_stock_threshold: p.low_stock_threshold,
     is_active: !!p.is_active,
     category_id: p.category_id ?? null, brand_id: p.brand_id ?? null,
+    highlights: parseJson<string[]>(p.highlights, []), specs: parseJson<{ key: string; value: string }[]>(p.specs, []), tags: parseJson<string[]>(p.tags, []),
+    weight_g: p.weight_g ?? null, length_cm: p.length_cm == null ? null : Number(p.length_cm), width_cm: p.width_cm == null ? null : Number(p.width_cm), height_cm: p.height_cm == null ? null : Number(p.height_cm),
+    country_of_origin: p.country_of_origin ?? null, manufacturer: p.manufacturer ?? null, shelf_life_days: p.shelf_life_days ?? null, warranty_months: p.warranty_months ?? null, return_days: p.return_days ?? null,
     review_status: p.review_status ?? 'approved', review_note: p.review_note ?? null,
     tiers: tiers.map((t) => ({ min_qty: t.min_qty, price: fromPaise(t.price_paise) })),
     images: images.map((i) => ({ id: i.id, url: imageUrl(i.file_key) })), image_url: images[0] ? imageUrl(images[0].file_key) : null,
@@ -139,7 +147,33 @@ const productFields = {
   low_stock_threshold: z.number().int().min(0).max(1_000_000),
   is_active: z.boolean(),
   tiers: z.array(tierSchema).max(5),
+  // online-shop listing details (all optional)
+  highlights: z.array(z.string().trim().min(1).max(150)).max(8).optional(),
+  specs: z.array(z.object({ key: z.string().trim().min(1).max(60), value: z.string().trim().min(1).max(200) })).max(20).optional(),
+  tags: z.array(z.string().trim().min(1).max(30)).max(10).optional(),
+  weight_g: z.number().int().min(0).max(10_000_000).nullable().optional(),
+  length_cm: z.number().min(0).max(100_000).nullable().optional(),
+  width_cm: z.number().min(0).max(100_000).nullable().optional(),
+  height_cm: z.number().min(0).max(100_000).nullable().optional(),
+  country_of_origin: optText(60),
+  manufacturer: optText(120),
+  shelf_life_days: z.number().int().min(0).max(36_500).nullable().optional(),
+  warranty_months: z.number().int().min(0).max(600).nullable().optional(),
+  return_days: z.number().int().min(0).max(365).nullable().optional(),
 };
+
+/** Saves the listing-detail fields that were sent (and only those) for a product. */
+const DETAIL_COLS = ['highlights', 'specs', 'tags', 'weight_g', 'length_cm', 'width_cm', 'height_cm', 'country_of_origin', 'manufacturer', 'shelf_life_days', 'warranty_months', 'return_days'] as const;
+async function saveDetails(c: Conn, productId: number, b: Record<string, any>) {
+  const sets: string[] = []; const args: unknown[] = [];
+  for (const k of DETAIL_COLS) {
+    if (b[k] === undefined) continue;
+    const v = b[k];
+    sets.push(`${k} = ?`);
+    args.push(k === 'highlights' || k === 'specs' || k === 'tags' ? (v && v.length ? JSON.stringify(v) : null) : (v === '' ? null : v));
+  }
+  if (sets.length) await exec(c, `UPDATE products SET ${sets.join(', ')} WHERE id = ?`, [...args, productId]);
+}
 
 const createSchema = z.object({
   ...productFields,
@@ -254,13 +288,19 @@ const tidyName = (brand: string, product: string, quantity: string) => {
 async function lookupOnline(barcode: string): Promise<{ source: string; suggestion: Record<string, unknown> } | null> {
   for (const host of OFF_HOSTS) {
     try {
-      const j = await getJson(`https://${host}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=product_name,brands,quantity,categories,generic_name,image_front_url`);
+      const j = await getJson(`https://${host}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=product_name,product_name_en,brands,quantity,categories,generic_name,ingredients_text,ingredients_text_en,image_front_url,image_url,image_ingredients_url,image_nutrition_url`);
       const p = j?.status === 1 ? j.product : null;
-      if (p?.product_name) {
+      const productName = String(p?.product_name || p?.product_name_en || '').trim();
+      if (productName) {
         const brand = firstOf(p.brands);
+        const generic = String(p.generic_name ?? '').trim();
+        const ingredients = String(p.ingredients_text_en || p.ingredients_text || '').trim();
+        const description = [generic, ingredients ? `Ingredients: ${ingredients}` : ''].filter(Boolean).join('. ').slice(0, 500) || null;
+        const image_urls = [p.image_front_url, p.image_url, p.image_ingredients_url, p.image_nutrition_url]
+          .filter((u: unknown): u is string => typeof u === 'string' && u.startsWith('https://')).filter((u, i, all) => all.indexOf(u) === i).slice(0, 3);
         return { source: host.split('.')[1], suggestion: {
-          name: tidyName(brand, String(p.product_name), String(p.quantity ?? '')), brand: brand || null,
-          category: firstOf(p.categories) || null, description: String(p.generic_name ?? '').trim().slice(0, 500) || null, image_url: typeof p.image_front_url === 'string' ? p.image_front_url : null,
+          name: tidyName(brand, productName, String(p.quantity ?? '')), brand: brand || null, pack_size: String(p.quantity ?? '').trim() || null, highlights: [generic].filter(Boolean),
+          category: firstOf(String(p.categories ?? '').split(',').pop()) || firstOf(p.categories) || null, description, image_url: image_urls[0] ?? null, image_urls,
         } };
       }
     } catch { /* try the next source */ }
@@ -269,7 +309,7 @@ async function lookupOnline(barcode: string): Promise<{ source: string; suggesti
     const j = await getJson(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(barcode)}`);
     const p = j?.items?.[0];
     if (p?.title) return { source: 'upcitemdb', suggestion: { name: String(p.title).slice(0, 190), brand: String(p.brand ?? '').trim() || null, category: firstOf(String(p.category ?? '').split('>').pop()) || null,
-      description: String(p.description ?? '').trim().slice(0, 500) || null, image_url: null } };
+      description: String(p.description ?? '').trim().slice(0, 500) || null, image_url: null, image_urls: [] } };
   } catch { /* no suggestion */ }
   return null;
 }
@@ -403,6 +443,7 @@ catalogRouter.post('/', ...writer, asyncHandler(async (req, res) => {
       await recordPrice(c, r.insertId, null, price, d);
       if (b.stock_qty > 0) await changeStock(c, { productId: r.insertId, distributorId: d, delta: b.stock_qty, reason: 'initial', actorId: d });
       if (b.cost != null && b.cost !== '') await exec(c, 'UPDATE products SET cost_paise = ? WHERE id = ?', [toPaise(b.cost), r.insertId]);
+      await saveDetails(c, r.insertId, b);
       await syncProduct(c, r.insertId, d, 'create');
       return r.insertId;
     });
@@ -441,6 +482,7 @@ catalogRouter.patch('/:id', ...writer, asyncHandler(async (req, res) => {
         await audit(d, 'catalog.price_change', 'product', id, { from: fromPaise(Number(cur.price_paise)), to: fromPaise(price) }, c);
       }
       if (body.cost !== undefined) await exec(c, 'UPDATE products SET cost_paise = ? WHERE id = ?', [body.cost == null || body.cost === '' ? null : toPaise(body.cost), id]);
+      await saveDetails(c, id, body);
       await syncProduct(c, id, d, 'update');
     });
     const p = await q1<any>(pool, 'SELECT * FROM products WHERE id = ?', [id]);
@@ -479,6 +521,7 @@ catalogRouter.post('/:id/duplicate', ...writer, asyncHandler(async (req, res) =>
       VALUES (?,?,NULL,?,?,?,?,?,?,0,?,?,?,?,0)`, [d, `${cur.name} (copy)`.slice(0, 190), cur.category, cur.brand, cur.unit, cur.description, cur.price_paise, cur.mrp_paise, cur.min_order_qty, cur.low_stock_threshold, cur.hsn, cur.gst_rate_bps]);
     const tiers = (await loadTiers(c, [id])).get(id) ?? [];
     await replaceTiers(c, r.insertId, tiers);
+    await saveDetails(c, r.insertId, Object.fromEntries(DETAIL_COLS.map((k) => [k, ['highlights', 'specs', 'tags'].includes(k) ? parseJson<any[]>(cur[k], []) : cur[k] ?? null])));
     await recordPrice(c, r.insertId, null, Number(cur.price_paise), d);
     await syncProduct(c, r.insertId, d, 'duplicate');
     return r.insertId; // starts hidden with no stock, so a copy can never be sold by accident
