@@ -1,4 +1,4 @@
 {
-  "functions": { "api/index.ts": { "includeFiles": "migrations/**" } },
+  "functions": { "api/index.ts": { "includeFiles": "{migrations,public}/**" } },
   "rewrites": [{ "source": "/(.*)", "destination": "/api" }]
 }

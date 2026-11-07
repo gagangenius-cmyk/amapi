@@ -46,7 +46,9 @@ export function createApp() {
   app.use(helmet());
   app.use(compression());
   app.use(metricsMiddleware);
-  if (process.env.TRUST_PROXY) app.set('trust proxy', Number(process.env.TRUST_PROXY));
+  // behind Vercel's proxy the client IP is in X-Forwarded-For; without this every user shares one rate-limit bucket
+  const trustProxy = process.env.TRUST_PROXY ?? (process.env.VERCEL ? '1' : '');
+  if (trustProxy) app.set('trust proxy', Number(trustProxy));
   // Production: only the listed origins may call the API from a browser (native apps send no Origin and are unaffected). Unset = no cross-origin access.
   app.use(cors(process.env.CORS_ORIGIN ? { origin: process.env.CORS_ORIGIN.split(',') } : env.isProd ? { origin: false } : undefined));
   // catalog imports send up to 500 rows. The payment webhook also keeps the exact bytes: its signature covers them.
