@@ -39,6 +39,29 @@ export const dbStorage: Storage = {
   async remove(key) { await exec(pool, 'DELETE FROM file_blobs WHERE file_key = ?', [key]); },
 };
 
+/** Vercel Blob (STORAGE=blob + BLOB_READ_WRITE_TOKEN). Keys are already unguessable and never overwritten. */
+export const blobStorage: Storage = {
+  async put(key, data, mime) {
+    const { put } = await import('@vercel/blob');
+    await put(`media/${key}`, data, { access: 'public', contentType: mime, addRandomSuffix: false, allowOverwrite: false, cacheControlMaxAge: 31536000 });
+  },
+  async read(key) {
+    const { head, BlobNotFoundError } = await import('@vercel/blob');
+    try {
+      const meta = await head(`media/${key}`);
+      const r = await fetch(meta.url);
+      return r.ok ? Buffer.from(await r.arrayBuffer()) : null;
+    } catch (e: any) {
+      if (e instanceof BlobNotFoundError) return null;
+      throw e;
+    }
+  },
+  async remove(key) {
+    const { del } = await import('@vercel/blob');
+    await del(`media/${key}`);
+  },
+};
+
 /** Minimal slice of the AWS SDK client we use, so tests can plug in a fake. */
 export interface S3Like { send(command: any): Promise<any> }
 
@@ -65,6 +88,7 @@ let override: Storage | null = null;
 export const setStorage = (s: Storage | null) => { override = s; current = null; };
 
 async function build(): Promise<Storage> {
+  if (process.env.STORAGE === 'blob') return blobStorage;
   if (process.env.STORAGE === 's3') {
     if (!process.env.S3_BUCKET) throw new Error('STORAGE=s3 needs S3_BUCKET');
     const sdk = await import('@aws-sdk/client-s3');                  // loaded only when used: local setups do not need it
