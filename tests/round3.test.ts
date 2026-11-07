@@ -231,6 +231,13 @@ describe('admin console API', () => {
     const stats = (await request(app).get('/api/v1/admin/stats').set(auth(a.token)).expect(200)).body;
     expect(stats.users.retailer.count).toBeGreaterThanOrEqual(1);
     await request(app).get('/api/v1/admin/stats').set(auth(d.token)).expect(403);
+    expect(stats.devices).toMatchObject({ total: expect.any(Number), android: expect.any(Number), ios: expect.any(Number) });
+    expect(Number(stats.gtv_month)).toBeGreaterThanOrEqual(0);
+    const monthly = (await request(app).get('/api/v1/admin/metrics/monthly?months=3').set(auth(a.token)).expect(200)).body.months;
+    expect(monthly).toHaveLength(3);
+    expect(monthly[2].month).toBe(new Date().toISOString().slice(0, 7));            // newest month last, empty months still listed
+    expect(monthly[2]).toMatchObject({ orders: expect.any(Number), new_users: expect.any(Number) });
+    await request(app).get('/api/v1/admin/metrics/monthly').set(auth(d.token)).expect(403);
 
     await request(app).post('/api/v1/auth/login').send({ phone: r.phone, password: 'wrong-wrong1' }).expect(401);
     const log = (await request(app).get('/api/v1/admin/audit').query({ action: 'auth.login_failed' }).set(auth(a.token)).expect(200)).body;

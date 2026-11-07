@@ -1,3 +1,4 @@
+import { NEAR_METRES } from '../field/field.routes';
 import { Router } from 'express';
 import { z } from 'zod';
 import { exec, pool, q, q1 } from '../../db/pool';
@@ -58,12 +59,56 @@ adminRouter.get('/stats', asyncHandler(async (_req, res) => {
   const exp = (await q1<any>(pool, 'SELECT COUNT(*) n FROM distributor_profiles WHERE subscription_ends_at BETWEEN UTC_TIMESTAMP() AND DATE_ADD(UTC_TIMESTAMP(), INTERVAL 7 DAY)'))!;
   const fails = (await q1<any>(pool, "SELECT COUNT(*) n FROM audit_log WHERE action IN ('auth.login_failed','auth.totp_failed') AND created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 DAY)"))!;
   const push = await q<any>(pool, "SELECT status, COUNT(*) n FROM push_outbox WHERE created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 DAY) GROUP BY status");
+  const gm = (await q1<any>(pool, "SELECT COALESCE(SUM(total_paise),0) gtv FROM orders WHERE status NOT IN ('rejected','cancelled') AND created_at >= DATE_FORMAT(UTC_TIMESTAMP(), '%Y-%m-01')"))!;
+  const dev = (await q1<any>(pool, "SELECT COUNT(*) total, COALESCE(SUM(platform = 'android'),0) android, COALESCE(SUM(platform = 'ios'),0) ios, COALESCE(SUM(created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL 30 DAY)),0) new30 FROM push_tokens"))!;
   res.json({
     push_24h: Object.fromEntries(push.map((p) => [p.status, Number(p.n)])),
     users: Object.fromEntries(users.map((u) => [u.role, { count: Number(u.n), inactive: Number(u.inactive) }])),
+    gtv_month: fromPaise(Number(gm.gtv)), devices: { total: Number(dev.total), android: Number(dev.android), ios: Number(dev.ios), last_30d: Number(dev.new30) },
     orders: Number(o.n), orders_today: Number(o.today), gmv: fromPaise(Number(o.gmv)), receivables: fromPaise(Number(due.due)),
     subscriptions_expiring_7d: Number(exp.n), failed_logins_24h: Number(fails.n),
   });
+}));
+
+// Month-by-month growth: GTV (value of every order that was not rejected or cancelled), order count, and devices that registered for push
+// (the nearest measure of installs the API has: store download counts live in Google Play / App Store, not here).
+adminRouter.get('/metrics/monthly', asyncHandler(async (req, res) => {
+  const { months } = z.object({ months: z.coerce.number().int().min(1).max(36).default(12) }).parse(req.query);
+  const start = "DATE_SUB(DATE_FORMAT(UTC_TIMESTAMP(), '%Y-%m-01'), INTERVAL ? MONTH)";
+  const orders = await q<any>(pool, `SELECT DATE_FORMAT(created_at, '%Y-%m') m, COUNT(*) n, COALESCE(SUM(total_paise),0) gtv FROM orders
+    WHERE status NOT IN ('rejected','cancelled') AND created_at >= ${start} GROUP BY m`, [months - 1]);
+  const devices = await q<any>(pool, `SELECT DATE_FORMAT(created_at, '%Y-%m') m, COUNT(*) n FROM push_tokens WHERE created_at >= ${start} GROUP BY m`, [months - 1]);
+  const users = await q<any>(pool, `SELECT DATE_FORMAT(created_at, '%Y-%m') m, COUNT(*) n FROM users WHERE created_at >= ${start} GROUP BY m`, [months - 1]);
+  const by = (rows: any[]) => new Map(rows.map((r) => [r.m as string, r]));
+  const o = by(orders), d = by(devices), u = by(users);
+  const out: { month: string; gtv: string; orders: number; devices: number; new_users: number }[] = [];
+  const now = new Date();
+  for (let i = months - 1; i >= 0; i--) {
+    const t = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+    const m = `${t.getUTCFullYear()}-${String(t.getUTCMonth() + 1).padStart(2, '0')}`;
+    out.push({ month: m, gtv: fromPaise(Number(o.get(m)?.gtv ?? 0)), orders: Number(o.get(m)?.n ?? 0), devices: Number(d.get(m)?.n ?? 0), new_users: Number(u.get(m)?.n ?? 0) });
+  }
+  res.json({ months: out });
+}));
+
+// QR scan history across the platform: every retailer visit an employee punched (who, which shop, when, where, how far from the shop).
+adminRouter.get('/visits', asyncHandler(async (req, res) => {
+  const qs = z.object({
+    days: z.coerce.number().int().min(1).max(365).default(30), distributor_id: z.coerce.number().int().positive().optional(),
+    employee_id: z.coerce.number().int().positive().optional(), q: z.string().trim().max(60).optional(),
+    before: z.coerce.number().int().positive().optional(), limit: z.coerce.number().int().min(1).max(200).default(50),
+  }).parse(req.query);
+  const where = ['v.visited_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)']; const args: unknown[] = [qs.days];
+  if (qs.distributor_id) { where.push('v.distributor_id = ?'); args.push(qs.distributor_id); }
+  if (qs.employee_id) { where.push('v.employee_id = ?'); args.push(qs.employee_id); }
+  if (qs.q) { where.push('(rp.shop_name LIKE ? OR e.name LIKE ?)'); args.push(`%${qs.q}%`, `%${qs.q}%`); }
+  if (qs.before) { where.push('v.id < ?'); args.push(qs.before); }
+  const rows = await q<any>(pool, `SELECT v.id, v.distributor_id, dp.business_name distributor_name, v.employee_id, e.name employee_name, v.retailer_id, rp.shop_name,
+      v.visited_at, v.lat, v.lng, v.distance_m, v.beat_id
+    FROM visits v JOIN users e ON e.id = v.employee_id JOIN retailer_profiles rp ON rp.user_id = v.retailer_id LEFT JOIN distributor_profiles dp ON dp.user_id = v.distributor_id
+    WHERE ${where.join(' AND ')} ORDER BY v.id DESC LIMIT ?`, [...args, qs.limit + 1]);
+  const page = rows.slice(0, qs.limit);
+  res.json({ visits: page.map((r) => ({ ...r, lat: r.lat == null ? null : Number(r.lat), lng: r.lng == null ? null : Number(r.lng), near: r.distance_m != null && r.distance_m <= NEAR_METRES })), next_before: rows.length > qs.limit ? page[page.length - 1].id : null });
 }));
 
 // The audit trail, newest first, filterable. `before` pages backwards.

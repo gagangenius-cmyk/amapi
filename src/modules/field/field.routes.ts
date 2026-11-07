@@ -20,7 +20,7 @@ export const fieldRouter = Router();
 fieldRouter.use(authenticate);
 
 const VISIT_CODE_TTL_S = 180;
-const NEAR_METRES = 300;
+export const NEAR_METRES = 300;
 const IST_MS = 5.5 * 3600_000;
 const todayIstWeekday = (now = Date.now()) => new Date(now + IST_MS).getUTCDay(); // 0 = Sunday
 
@@ -215,6 +215,15 @@ fieldRouter.get('/visits', requireRole('distributor'), asyncHandler(async (req, 
     FROM visits v JOIN users e ON e.id = v.employee_id JOIN retailer_profiles rp ON rp.user_id = v.retailer_id
     WHERE v.distributor_id = ? AND v.visited_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) ${qs.employee_id ? 'AND v.employee_id = ?' : ''}
     ORDER BY v.id DESC LIMIT 300`, qs.employee_id ? [d, qs.days, qs.employee_id] : [d, qs.days]);
+  res.json({ visits: rows.map((r) => ({ ...r, near: r.distance_m != null && r.distance_m <= NEAR_METRES })) });
+}));
+
+// An employee's own QR scan history (the visits they punched), newest first.
+fieldRouter.get('/my-visits', requireRole('employee'), asyncHandler(async (req, res) => {
+  const { days } = z.object({ days: z.coerce.number().int().min(1).max(90).default(30) }).parse(req.query);
+  const rows = await q<any>(pool, `SELECT v.id, v.retailer_id, rp.shop_name, v.visited_at, v.distance_m, v.lat, v.lng, v.beat_id
+    FROM visits v JOIN retailer_profiles rp ON rp.user_id = v.retailer_id
+    WHERE v.employee_id = ? AND v.visited_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) ORDER BY v.id DESC LIMIT 300`, [req.auth!.userId, days]);
   res.json({ visits: rows.map((r) => ({ ...r, near: r.distance_m != null && r.distance_m <= NEAR_METRES })) });
 }));
 

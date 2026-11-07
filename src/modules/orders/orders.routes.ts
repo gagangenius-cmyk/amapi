@@ -17,9 +17,11 @@ import { allowedCategoryIds, audienceClause, categoryClause } from '../catalog/s
 import { earnCommission, snapshotFor } from '../commission/commission.service';
 import { postLedger } from '../ledger/ledger.service';
 import { storeAccess } from '../retailers/access';
+import { milestoneRouter } from './milestones.routes';
 
 export const orderRouter = Router();
 orderRouter.use(authenticate);
+orderRouter.use('/:id/milestones', milestoneRouter);
 
 type Status = 'placed' | 'accepted' | 'dispatched' | 'out_for_delivery' | 'delivered' | 'rejected' | 'cancelled';
 
