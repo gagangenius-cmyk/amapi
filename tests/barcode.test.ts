@@ -35,6 +35,17 @@ describe('barcode lookup', () => {
     expect((await info(d1, 'NOPE-12345').expect(200)).body.source).toBe('none');
   });
 
+  it('finds a product whether the scan reports its barcode as UPC-A (12 digits) or EAN-13 (leading 0)', async () => {
+    const d = await dist();
+    await request(app).post('/api/v1/catalog').set(auth(d)).send({ name: 'Upc Biscuit', unit: 'pcs', price: '20', stock_qty: 5, barcode: '036000291452' }).expect(201);
+    const lookup = (code: string) => request(app).get(`/api/v1/catalog/lookup?barcode=${code}`).set(auth(d));
+    expect((await lookup('036000291452').expect(200)).body.name).toBe('Upc Biscuit');
+    expect((await lookup('0036000291452').expect(200)).body.name).toBe('Upc Biscuit');
+    expect((await info(d, '0036000291452').expect(200)).body.source).toBe('own');
+    const list = (await request(app).get('/api/v1/catalog?q=0036000291452').set(auth(d)).expect(200)).body.products;
+    expect(list.map((x: any) => x.name)).toContain('Upc Biscuit');
+  });
+
   it('only imports photos from the public product databases', async () => {
     const d = await dist();
     const pid = (await request(app).post('/api/v1/catalog').set(auth(d)).send({ name: 'Plain', price: '10', stock_qty: 1 }).expect(201)).body.id;

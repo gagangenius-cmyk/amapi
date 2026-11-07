@@ -27,6 +27,9 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
   if ((err as { type?: string })?.type === 'entity.parse.failed') {
     return res.status(400).json({ error: { code: 'BAD_JSON', message: 'Malformed JSON body' } });
   }
+  if ((err as { type?: string })?.type === 'entity.too.large') {
+    return res.status(413).json({ error: { code: 'TOO_LARGE', message: 'That file is too large. Photos can be up to 4 MB: choose a smaller one or a lower quality.' } });
+  }
   const reqId = res.getHeader('x-request-id');
   logger.error({ err, reqId, method: req.method, url: req.originalUrl, userId: req.auth?.userId }, 'unhandled error');
   res.status(500).json({ error: { code: 'INTERNAL', message: 'Internal server error', request_id: reqId } });

@@ -142,6 +142,16 @@ describe('refresh-token theft detection', () => {
 });
 
 describe('product photos', () => {
+  it('accepts what phones really send: image/jpg or no type, and photos up to 4 MB; refuses bigger', async () => {
+    const { d, pid } = await setup();
+    const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(40, 1)]);
+    const up = (body: Buffer, type: string) => request(app).post(`/api/v1/catalog/${pid}/images`).set(auth(d.token)).set('Content-Type', type).send(body);
+    expect((await up(jpeg, 'image/jpg')).status).toBe(201);
+    expect((await up(jpeg, 'application/octet-stream')).status).toBe(201);
+    expect((await up(Buffer.concat([png(), Buffer.alloc(3 * 1024 * 1024)]), 'image/png')).status).toBe(201);
+    expect((await up(Buffer.concat([png(), Buffer.alloc(5 * 1024 * 1024)]), 'image/png')).status).toBe(413);
+  });
+
   it('uploads, serves, covers and deletes; rejects fakes and strangers', async () => {
     const { d, pid } = await setup(); const other = await reg('distributor');
     const up = (t: string, body: Buffer | string, type = 'image/png', id = pid) => request(app).post(`/api/v1/catalog/${id}/images`).set(auth(t)).set('Content-Type', type).send(body);

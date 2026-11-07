@@ -1,3 +1,4 @@
+import { barcodeForms } from '../../utils/barcode';
 import crypto from 'crypto';
 import express, { Router } from 'express';
 import { z } from 'zod';
@@ -83,7 +84,7 @@ export async function storefrontProducts(distributorId: number, opts: { q?: stri
   // products kept for chosen retailers are invisible to everyone else
   const own = audienceClause(opts.retailerId);
   where.push(own.sql.replace(/^ AND /, '')); args.push(...own.args);
-  if (opts.q) { where.push('(name LIKE ? OR brand LIKE ? OR sku LIKE ? OR barcode = ? OR variant_group LIKE ?)'); const like = `%${opts.q}%`; args.push(like, like, like, opts.q, like); }
+  if (opts.q) { where.push('(name LIKE ? OR brand LIKE ? OR sku LIKE ? OR barcode IN (?) OR variant_group LIKE ?)'); const like = `%${opts.q}%`; args.push(like, like, like, barcodeForms(opts.q), like); }
   if (opts.category) { where.push('category = ?'); args.push(opts.category); }
   const rows = await q<any>(pool, `SELECT * FROM products WHERE ${where.join(' AND ')} ORDER BY (stock_qty > 0) DESC, COALESCE(variant_group, name), name, variant_label LIMIT ? OFFSET ?`, [...args, opts.limit ?? 200, opts.offset ?? 0]);
   const categories = (await q<any>(pool, `SELECT DISTINCT category FROM products WHERE distributor_id = ? AND deleted_at IS NULL AND is_active = 1 AND review_status = 'approved' AND category IS NOT NULL${scope.sql}${own.sql} ORDER BY category`, [distributorId, ...scope.args, ...own.args])).map((r) => r.category as string);
@@ -233,7 +234,7 @@ catalogRouter.get('/', requireRole('distributor', 'employee'), asyncHandler(asyn
   const d = req.auth!.distributorId!;
   const where = ['distributor_id = ?', 'deleted_at IS NULL'];
   const args: unknown[] = [d];
-  if (qs.q) { where.push('(name LIKE ? OR brand LIKE ? OR sku LIKE ? OR category LIKE ? OR barcode = ?)'); const like = `%${qs.q}%`; args.push(like, like, like, like, qs.q); }
+  if (qs.q) { where.push('(name LIKE ? OR brand LIKE ? OR sku LIKE ? OR category LIKE ? OR barcode IN (?))'); const like = `%${qs.q}%`; args.push(like, like, like, like, barcodeForms(qs.q)); }
   if (qs.category) { where.push('category = ?'); args.push(qs.category); }
   if (qs.status === 'active') where.push('is_active = 1');
   if (qs.status === 'hidden') where.push('is_active = 0');
@@ -264,7 +265,7 @@ catalogRouter.get('/taxonomy', requireRole('distributor', 'employee'), asyncHand
 
 catalogRouter.get('/lookup', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
   const { barcode } = z.object({ barcode: z.string().trim().min(1).max(40) }).parse(req.query);
-  const p = await q1<any>(pool, 'SELECT * FROM products WHERE distributor_id = ? AND barcode = ? AND deleted_at IS NULL', [req.auth!.distributorId, barcode]);
+  const p = await q1<any>(pool, 'SELECT * FROM products WHERE distributor_id = ? AND barcode IN (?) AND deleted_at IS NULL', [req.auth!.distributorId, barcodeForms(barcode)]);
   if (!p) throw notFound('Product');
   res.json((await presentProducts(pool, [p]))[0]);
 }));
@@ -321,11 +322,11 @@ async function lookupOnline(barcode: string): Promise<{ source: string; suggesti
  */
 catalogRouter.get('/barcode-info', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
   const { barcode } = z.object({ barcode: z.string().trim().min(4).max(40) }).parse(req.query);
-  const own = await q1<any>(pool, 'SELECT * FROM products WHERE distributor_id = ? AND barcode = ? AND deleted_at IS NULL ORDER BY id LIMIT 1', [req.auth!.distributorId, barcode]);
+  const own = await q1<any>(pool, 'SELECT * FROM products WHERE distributor_id = ? AND barcode IN (?) AND deleted_at IS NULL ORDER BY id LIMIT 1', [req.auth!.distributorId, barcodeForms(barcode)]);
   if (own) { res.json({ source: 'own', existing: (await presentProducts(pool, [own]))[0] }); return; }
 
   const other = await q1<any>(pool, `SELECT name, brand, category, unit, hsn, gst_rate_bps, mrp_paise, description FROM products
-    WHERE barcode = ? AND distributor_id <> ? AND deleted_at IS NULL AND review_status = 'approved' ORDER BY id DESC LIMIT 1`, [barcode, req.auth!.distributorId]);
+    WHERE barcode IN (?) AND distributor_id <> ? AND deleted_at IS NULL AND review_status = 'approved' ORDER BY id DESC LIMIT 1`, [barcodeForms(barcode), req.auth!.distributorId]);
   if (other) {
     res.json({ source: 'catalog', suggestion: { name: other.name, brand: other.brand, category: other.category, unit: other.unit, hsn: other.hsn, gst_rate_bps: other.gst_rate_bps, mrp: other.mrp_paise == null ? null : fromPaise(Number(other.mrp_paise)), description: other.description } });
     return;
@@ -530,14 +531,14 @@ catalogRouter.post('/:id/duplicate', ...writer, asyncHandler(async (req, res) =>
 }));
 
 // ---------------------------------------------------------------------------------------------
-// Photos: raw image bytes in the request body (jpeg / png / webp, up to 1.5 MB, 5 per product). The first one is the cover.
+// Photos: raw image bytes in the request body (jpeg / png / webp, up to 4 MB (the hosted request cap is 4.5 MB), 5 per product). The first one is the cover.
 // ---------------------------------------------------------------------------------------------
-const rawImage = express.raw({ type: ['image/jpeg', 'image/png', 'image/webp'], limit: '1.5mb' });
+const rawImage = express.raw({ type: ['image/*', 'application/octet-stream'], limit: '4mb' });
 const imagesOf = async (productId: number) => (await presentProducts(pool, [(await q1<any>(pool, 'SELECT * FROM products WHERE id = ?', [productId]))]))[0].images;
 
 catalogRouter.post('/:id/images', ...writer, rawImage, asyncHandler(async (req, res) => {
   const id = idParam(req); const d = req.auth!.userId;
-  if (!Buffer.isBuffer(req.body) || !req.body.length) throw new AppError(415, 'BAD_IMAGE', 'Send a JPEG, PNG or WebP image as the request body (max 1.5 MB)');
+  if (!Buffer.isBuffer(req.body) || !req.body.length) throw new AppError(415, 'BAD_IMAGE', 'Send a JPEG, PNG or WebP image as the request body (max 4 MB)');
   const mime = sniffImage(req.body);
   if (!mime) throw new AppError(415, 'BAD_IMAGE', 'That file is not a valid JPEG, PNG or WebP image');
   await assertSubscriptionActive(pool, d);
@@ -562,7 +563,7 @@ catalogRouter.post('/:id/images/import', ...writer, asyncHandler(async (req, res
   if (Number(n) >= MAX_IMAGES) throw new AppError(409, 'TOO_MANY_IMAGES', `A product can have at most ${MAX_IMAGES} photos`);
   const r = await fetch(u, { signal: AbortSignal.timeout(6000), redirect: 'error' }).catch(() => null);
   const bytes = r?.ok ? Buffer.from(await r.arrayBuffer()) : null;
-  if (!bytes || !bytes.length || bytes.length > 1.5 * 1024 * 1024) throw new AppError(422, 'IMAGE_UNAVAILABLE', 'The photo could not be fetched (or is larger than 1.5 MB)');
+  if (!bytes || !bytes.length || bytes.length > 4 * 1024 * 1024) throw new AppError(422, 'IMAGE_UNAVAILABLE', 'The photo could not be fetched (or is larger than 4 MB)');
   const mime = sniffImage(bytes);
   if (!mime) throw new AppError(415, 'BAD_IMAGE', 'That file is not a valid JPEG, PNG or WebP image');
   const key = crypto.randomBytes(20).toString('hex');

@@ -1,3 +1,4 @@
+import { barcodeForms } from '../../utils/barcode';
 import { Conn, exec, pool, q, q1 } from '../../db/pool';
 import { AppError } from '../../utils/errors';
 import { fromPaise } from '../../utils/money';
@@ -41,7 +42,7 @@ export interface Position {
 export async function positions(distributorId: number, opts: { q?: string; warehouseId?: number; lowOnly?: boolean; limit?: number; offset?: number } = {}) {
   const where = ['p.distributor_id = ?', 'p.deleted_at IS NULL'];
   const args: unknown[] = [distributorId];
-  if (opts.q) { where.push('(p.name LIKE ? OR p.sku LIKE ? OR p.barcode = ?)'); args.push(`%${opts.q}%`, `%${opts.q}%`, opts.q); }
+  if (opts.q) { where.push('(p.name LIKE ? OR p.sku LIKE ? OR p.barcode IN (?))'); args.push(`%${opts.q}%`, `%${opts.q}%`, barcodeForms(opts.q)); }
   if (opts.lowOnly) where.push('p.stock_qty <= p.low_stock_threshold');
   if (opts.warehouseId) where.push('EXISTS (SELECT 1 FROM inventory_balances ib WHERE ib.product_id = p.id AND ib.warehouse_id = ? AND (ib.qty > 0 OR ib.damaged_qty > 0))');
   if (opts.warehouseId) args.push(opts.warehouseId);
