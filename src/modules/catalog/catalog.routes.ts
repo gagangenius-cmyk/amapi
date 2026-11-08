@@ -455,13 +455,14 @@ catalogRouter.post('/', ...writer, asyncHandler(async (req, res) => {
 
 // Edit details, price and quantity breaks. Stock is deliberately NOT editable here: use POST /:id/stock so concurrent
 // sales can never be overwritten by a stale screen.
-catalogRouter.patch('/:id', ...writer, asyncHandler(async (req, res) => {
+// Employees may edit too, but always on their distributor's products.
+catalogRouter.patch('/:id', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
   const body = patchSchema.parse(req.body);
+  const d = req.auth!.role === 'employee' ? req.auth!.distributorId! : req.auth!.userId;
   await idsToNames(body);
-  if (body.category !== undefined) await assertCategoryAllowed(pool, req.auth!.userId, body.category);
+  if (body.category !== undefined) await assertCategoryAllowed(pool, d, body.category);
   if ('stock_qty' in (req.body ?? {})) throw new AppError(400, 'USE_STOCK_ENDPOINT', 'Change stock with POST /catalog/:id/stock');
   const id = idParam(req);
-  const d = req.auth!.userId;
   await assertSubscriptionActive(pool, d);
   try {
     await withTx(async (c) => {
