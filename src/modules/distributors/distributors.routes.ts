@@ -82,17 +82,18 @@ distributorRouter.post('/employees', requireRole('distributor'), asyncHandler(as
   const b = z.object({
     phone: z.string().regex(/^\d{10}$/), name: z.string().min(2).max(120), password: z.string().min(8).max(100),
     email: z.string().trim().toLowerCase().email().max(190).optional(),
+    kind: z.enum(['sales', 'delivery']).default('sales'),
   }).parse(req.body);
   const id = req.auth!.userId;
   await assertSubscriptionActive(pool, id);
   await assertPermission(pool, id, 'employees_enabled');
   if (await q1(pool, 'SELECT id FROM users WHERE phone = ?', [b.phone])) throw new AppError(409, 'PHONE_TAKEN', 'Phone already registered');
   if (b.email && (await q1(pool, 'SELECT id FROM users WHERE email = ?', [b.email]))) throw new AppError(409, 'EMAIL_TAKEN', 'Email already registered');
-  const r = await exec(pool, "INSERT INTO users (role, phone, email, name, password_hash, owner_distributor_id, created_by) VALUES ('employee',?,?,?,?,?,?)", [
-    b.phone, b.email ?? null, b.name, await bcrypt.hash(b.password, 10), id, id,
+  const r = await exec(pool, "INSERT INTO users (role, phone, email, name, password_hash, owner_distributor_id, created_by, employee_kind) VALUES ('employee',?,?,?,?,?,?,?)", [
+    b.phone, b.email ?? null, b.name, await bcrypt.hash(b.password, 10), id, id, b.kind,
   ]);
   await audit(id, 'employee.create', 'user', r.insertId, { phone: b.phone });
-  res.status(201).json({ id: r.insertId, phone: b.phone, name: b.name });
+  res.status(201).json({ id: r.insertId, phone: b.phone, name: b.name, kind: b.kind });
 }));
 
 const OPEN = "('accepted','dispatched','out_for_delivery')";
@@ -100,7 +101,7 @@ const OPEN = "('accepted','dispatched','out_for_delivery')";
 // The team with their workload: how many deliveries each has open, and whether they can take more.
 distributorRouter.get('/employees', requireRole('distributor'), asyncHandler(async (req, res) => {
   const rows = await q<any>(pool, `
-    SELECT u.id, u.name, u.phone, u.is_active, u.is_available,
+    SELECT u.id, u.name, u.phone, u.is_active, u.is_available, u.employee_kind AS kind,
       (SELECT COUNT(*) FROM users r WHERE r.managed_by_id = u.id AND r.role = 'retailer') retailers,
       (SELECT COUNT(*) FROM orders o WHERE o.assigned_employee_id = u.id AND o.status IN ${OPEN}) open_orders,
       (SELECT COUNT(*) FROM orders o WHERE o.assigned_employee_id = u.id AND o.status = 'delivered'
@@ -111,17 +112,17 @@ distributorRouter.get('/employees', requireRole('distributor'), asyncHandler(asy
 
 // Mark someone on leave / back, or switch their login off.
 distributorRouter.put('/employees/:id', requireRole('distributor'), asyncHandler(async (req, res) => {
-  const b = z.object({ is_available: z.boolean().optional(), is_active: z.boolean().optional(), name: z.string().trim().min(2).max(120).optional() })
+  const b = z.object({ is_available: z.boolean().optional(), is_active: z.boolean().optional(), name: z.string().trim().min(2).max(120).optional(), kind: z.enum(['sales', 'delivery']).optional() })
     .refine((v) => Object.keys(v).length > 0, 'Nothing to change').parse(req.body);
   const id = idParam(req);
   const e = await q1<any>(pool, "SELECT id FROM users WHERE id = ? AND role = 'employee' AND owner_distributor_id = ?", [id, req.auth!.userId]);
   if (!e) throw notFound('Team member');
-  await exec(pool, 'UPDATE users SET is_available = COALESCE(?, is_available), is_active = COALESCE(?, is_active), name = COALESCE(?, name) WHERE id = ?', [
-    b.is_available === undefined ? null : b.is_available ? 1 : 0, b.is_active === undefined ? null : b.is_active ? 1 : 0, b.name ?? null, id,
+  await exec(pool, 'UPDATE users SET is_available = COALESCE(?, is_available), is_active = COALESCE(?, is_active), name = COALESCE(?, name), employee_kind = COALESCE(?, employee_kind) WHERE id = ?', [
+    b.is_available === undefined ? null : b.is_available ? 1 : 0, b.is_active === undefined ? null : b.is_active ? 1 : 0, b.name ?? null, b.kind ?? null, id,
   ]);
   if (b.is_active === false) { await exec(pool, 'UPDATE refresh_tokens SET revoked_at = UTC_TIMESTAMP() WHERE user_id = ? AND revoked_at IS NULL', [id]); invalidateUser(id); }
   await audit(req.auth!.userId, 'employee.update', 'user', id, b);
-  res.json(await q1(pool, 'SELECT id, name, phone, is_active, is_available FROM users WHERE id = ?', [id]));
+  res.json(await q1(pool, 'SELECT id, name, phone, is_active, is_available, employee_kind AS kind FROM users WHERE id = ?', [id]));
 }));
 
 // Delivery staff can mark themselves unavailable (and back) from their own phone.

@@ -20,6 +20,7 @@ export function presentRow(r: any) {
     amount: fromPaise(Number(r.amount_paise)), delta: fromPaise(Number(r.delta_paise)),
     balance_after: fromPaise(Number(r.balance_after_paise)), payment_mode: r.payment_mode,
     cash_denominations: r.cash_denominations ? JSON.parse(r.cash_denominations) : null,
+    receipt_no: r.receipt_no ?? null, upi_ref: r.upi_ref ?? null,
     reversal_of: r.reversal_of, notes: r.notes, created_by: r.created_by, created_at: r.created_at,
     dispute: r.dispute_id ? { id: r.dispute_id, status: r.dispute_status, reason: r.dispute_reason } : null,
   };
@@ -46,6 +47,9 @@ const postSchema = z.object({
   amount: z.union([z.string(), z.number()]),
   cash_denominations: z.record(z.string(), z.number()).optional(),
   notes: z.string().max(500).optional(),
+  payment_mode: z.enum(['cash', 'upi']).default('cash'),
+  upi_ref: z.string().trim().min(4).max(60).optional(),
+  receipt_no: z.string().trim().min(1).max(40).optional(),
 });
 
 // Distributor / employee records a cash payment or an adjustment note.
@@ -60,16 +64,18 @@ ledgerRouter.post('/transaction', authenticate, requireRole('distributor', 'empl
   await assertPermission(pool, distributorId, 'khatabook_enabled');
 
   const amountPaise = toPaise(b.amount);
-  if (b.transaction_type === 'payment_cash') validateDenominations(b.cash_denominations, amountPaise);
+  const byUpi = b.transaction_type === 'payment_cash' && b.payment_mode === 'upi';
+  if (byUpi && !b.upi_ref) throw new AppError(400, 'UPI_REF_REQUIRED', 'Enter the UPI reference (UTR) the retailer paid with');
+  if (b.transaction_type === 'payment_cash' && !byUpi) validateDenominations(b.cash_denominations, amountPaise);
 
   const { row, replayed } = await safePost({
-    distributorId, retailerId: b.retailer_id, type: b.transaction_type as LedgerType, amountPaise,
-    createdBy: req.auth!.userId, idempotencyKey: key, paymentMode: b.transaction_type === 'payment_cash' ? 'cash' : null,
-    denominations: b.transaction_type === 'payment_cash' ? b.cash_denominations : undefined, notes: b.notes,
+    distributorId, retailerId: b.retailer_id, type: (byUpi ? 'payment_online' : b.transaction_type) as LedgerType, amountPaise,
+    createdBy: req.auth!.userId, idempotencyKey: key, paymentMode: b.transaction_type === 'payment_cash' ? (byUpi ? 'upi' : 'cash') : null, receiptNo: b.receipt_no ?? null, upiRef: byUpi ? b.upi_ref : null,
+    denominations: b.transaction_type === 'payment_cash' && !byUpi ? b.cash_denominations : undefined, notes: b.notes,
   });
   if (!replayed) {
     await audit(req.auth!.userId, `ledger.${b.transaction_type}`, 'ledger', row.id, { retailer_id: b.retailer_id, amount: b.amount });
-    const what = { payment_cash: 'Cash payment recorded', credit_note: 'Credit note added', debit_note: 'Debit note added' }[b.transaction_type];
+    const what = { payment_cash: byUpi ? 'UPI payment recorded' : 'Cash payment recorded', credit_note: 'Credit note added', debit_note: 'Debit note added' }[b.transaction_type];
     notifyUsers([b.retailer_id], what, `₹${fromPaise(amountPaise)} in your khata. Tap to review, and dispute it if it is wrong.`, { type: 'payment' });
   }
   res.status(replayed ? 200 : 201).json({ replayed, transaction: presentRow(row) });

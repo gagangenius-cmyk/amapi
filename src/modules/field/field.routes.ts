@@ -1,13 +1,16 @@
-import { Router } from 'express';
+import crypto from 'crypto';
+import express, { Router } from 'express';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import { env } from '../../config/env';
 import { Conn, exec, pool, q, q1, withTx } from '../../db/pool';
 import { authenticate, requireRole } from '../../middleware/auth';
 import { audit } from '../../utils/audit';
+import { notifyUsers } from '../../services/notify';
 import { AppError, asyncHandler, notFound } from '../../utils/errors';
 import { idParam } from '../../utils/http';
 import { assertSubscriptionActive } from '../distributors/subscription';
+import { EXT, sniffImage, storage } from '../../services/storage';
 
 /**
  * FIELD SALES
@@ -272,4 +275,59 @@ fieldRouter.post('/punch', requireRole('employee'), asyncHandler(async (req, res
   const ins = await exec(pool, 'INSERT INTO visits (distributor_id, employee_id, retailer_id, beat_id, lat, lng, distance_m) VALUES (?,?,?,?,?,?,?)', [d, e, retailerId, planned?.id ?? null, b.lat ?? null, b.lng ?? null, distance]);
   await audit(e, 'visit.punch', 'user', retailerId, { visit_id: ins.insertId, distance_m: distance, planned: !!planned });
   res.status(201).json({ id: ins.insertId, shop_name: shop.shop_name, visited_at: new Date().toISOString(), distance_m: distance, near: distance != null && distance <= NEAR_METRES, planned: !!planned, repeated: false });
+}));
+
+// ---------------------------------------------------------------------------------------------
+// Field log: branding put up at a shop (poster, flex, board) and expired / returned goods taken back. Photo optional, record kept for all.
+// ---------------------------------------------------------------------------------------------
+const rawPhoto = express.raw({ type: ['image/*', 'application/octet-stream'], limit: '4mb' });
+const photoUrl = (key: string | null) => (key ? `/api/v1/media/${key}` : null);
+const presentLog = (r: any) => ({
+  id: r.id, kind: r.kind, title: r.title, note: r.note, product_name: r.product_name, qty: r.qty, photo_url: photoUrl(r.photo_key),
+  retailer_id: r.retailer_id, shop_name: r.shop_name ?? null, employee_id: r.employee_id, employee_name: r.employee_name ?? null, created_at: r.created_at,
+});
+
+fieldRouter.post('/logs', requireRole('employee'), asyncHandler(async (req, res) => {
+  const b = z.object({
+    retailer_id: z.number().int().positive(), kind: z.enum(['branding', 'expiry_pickup', 'return_pickup']),
+    title: z.string().trim().max(120).optional(), note: z.string().trim().max(500).optional(),
+    product_name: z.string().trim().max(190).optional(), qty: z.number().int().min(1).max(1_000_000).optional(),
+  }).refine((v) => v.kind === 'branding' || (v.product_name && v.qty), { message: 'Say which product and how many were taken back' }).parse(req.body);
+  const e = req.auth!.userId; const d = distributorOf(req);
+  await assertSubscriptionActive(pool, d);
+  if (!(await q1(pool, "SELECT 1 FROM retailer_distributor_relations WHERE distributor_id = ? AND retailer_id = ? AND status = 'active'", [d, b.retailer_id]))) throw new AppError(403, 'NOT_YOUR_SHOP', 'This shop is not one of the retailers of your distributor');
+  const r = await exec(pool, 'INSERT INTO field_logs (distributor_id, employee_id, retailer_id, kind, title, note, product_name, qty) VALUES (?,?,?,?,?,?,?,?)',
+    [d, e, b.retailer_id, b.kind, b.title ?? null, b.note ?? null, b.product_name ?? null, b.qty ?? null]);
+  await audit(e, `field.${b.kind}`, 'user', b.retailer_id, { log_id: r.insertId, qty: b.qty ?? null });
+  const what = b.kind === 'branding' ? 'Branding recorded' : b.kind === 'expiry_pickup' ? 'Expired stock taken back' : 'Returned goods taken back';
+  notifyUsers([b.retailer_id, d], what, `${b.title ?? b.product_name ?? ''}${b.qty ? ` × ${b.qty}` : ''}`.trim() || 'Open the app to see the details', { type: 'field', id: r.insertId });
+  res.status(201).json({ id: r.insertId });
+}));
+
+fieldRouter.post('/logs/:id/photo', requireRole('employee'), rawPhoto, asyncHandler(async (req, res) => {
+  const id = idParam(req);
+  if (!Buffer.isBuffer(req.body) || !req.body.length) throw new AppError(415, 'BAD_IMAGE', 'Send a JPEG, PNG or WebP image (max 4 MB)');
+  const mime = sniffImage(req.body);
+  if (!mime) throw new AppError(415, 'BAD_IMAGE', 'That file is not a valid JPEG, PNG or WebP image');
+  const log = await q1<any>(pool, 'SELECT id FROM field_logs WHERE id = ? AND employee_id = ?', [id, req.auth!.userId]);
+  if (!log) throw notFound('Field record');
+  const key = crypto.randomBytes(20).toString('hex');
+  await storage.put(`${key}.${EXT[mime]}`, req.body, mime);
+  await exec(pool, 'UPDATE field_logs SET photo_key = ?, photo_mime = ? WHERE id = ?', [key, mime, id]);
+  res.json({ id, photo_url: photoUrl(key) });
+}));
+
+// Everyone sees the same record: the distributor (office), the salesperson, and the retailer it is about.
+fieldRouter.get('/logs', requireRole('distributor', 'employee', 'retailer'), asyncHandler(async (req, res) => {
+  const qs = z.object({ kind: z.enum(['branding', 'expiry_pickup', 'return_pickup']).optional(), retailer_id: z.coerce.number().int().positive().optional(), limit: z.coerce.number().int().min(1).max(100).default(50) }).parse(req.query);
+  const a = req.auth!;
+  const where: string[] = []; const args: unknown[] = [];
+  if (a.role === 'retailer') { where.push('l.retailer_id = ?'); args.push(a.userId); }
+  else if (a.role === 'employee') { where.push('l.distributor_id = ? AND l.employee_id = ?'); args.push(a.distributorId, a.userId); }
+  else { where.push('l.distributor_id = ?'); args.push(a.userId); }
+  if (qs.kind) { where.push('l.kind = ?'); args.push(qs.kind); }
+  if (qs.retailer_id && a.role !== 'retailer') { where.push('l.retailer_id = ?'); args.push(qs.retailer_id); }
+  const rows = await q<any>(pool, `SELECT l.*, rp.shop_name, u.name employee_name FROM field_logs l JOIN retailer_profiles rp ON rp.user_id = l.retailer_id JOIN users u ON u.id = l.employee_id
+    WHERE ${where.join(' AND ')} ORDER BY l.id DESC LIMIT ?`, [...args, qs.limit]);
+  res.json({ logs: rows.map(presentLog) });
 }));

@@ -4,6 +4,7 @@ import { exec, lockName, pool, q } from '../db/pool';
 import { logger } from '../utils/logger';
 import { checkReceipts, flushOutbox, notifyUsers } from '../services/notify';
 import { receivablesOf, sendReminder } from '../modules/collections/collections.routes';
+import { runBeatReminders } from './beatReminders';
 
 /**
  * Subscription warnings. In the last `days` days a distributor is told every day how long is left (one push a day, however often this
@@ -90,5 +91,6 @@ export function startJobs() {
   cron.schedule('30 3 * * *', () => withLock('aymee_cleanup_job', async () => { logger.info(await runCleanup(), 'cleanup'); }).catch((err) => logger.error({ err }, 'cleanup job failed')));
   cron.schedule('0 10 * * *', () => withLock('aymee_overdue_job', async () => { logger.info({ sent: await runOverdueReminders() }, 'overdue reminders'); }).catch((err) => logger.error({ err }, 'overdue job failed')));
   cron.schedule('15 9 * * *', () => withLock('aymee_batch_expiry_job', async () => { logger.info({ distributors: await runBatchExpiryAlerts() }, 'batch expiry alerts'); }).catch((err) => logger.error({ err }, 'batch expiry job failed')));
+  cron.schedule('30 12 * * *', () => withLock('aymee_beat_job', async () => { logger.info({ sent: await runBeatReminders() }, 'beat reminders'); }).catch((err) => logger.error({ err }, 'beat reminder job failed')));
   cron.schedule('0 9 * * *', () => withLock('aymee_expiry_job', runExpiryWarnings).catch((err) => logger.error({ err }, 'expiry job failed')));
 }

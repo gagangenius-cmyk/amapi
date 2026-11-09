@@ -36,9 +36,9 @@ const TRANSITIONS: Record<Status, Partial<Record<Status, Array<'retailer' | 'dis
 
 const present = (o: any, items?: any[]) => ({
   id: o.id, retailer_id: o.retailer_id, distributor_id: o.distributor_id, status: o.status, total: fromPaise(Number(o.total_paise)), payment_method: o.payment_method ?? 'credit',
-  is_out_of_hierarchy: !!o.is_out_of_hierarchy, commission_rate_bps: o.commission_rate_bps, assigned_employee_id: o.assigned_employee_id,
+  is_out_of_hierarchy: !!o.is_out_of_hierarchy, commission_rate_bps: o.commission_rate_bps, assigned_employee_id: o.assigned_employee_id, deliver_on: o.deliver_on ? new Date(o.deliver_on).toISOString().slice(0, 10) : null, bill_type: o.bill_type ?? 'gst',
   created_at: o.created_at, invoice_no: o.invoice_no ?? null, is_adjusted: !!o.is_adjusted,
-  ...(o.retailer_name !== undefined && { retailer_name: o.retailer_name, distributor_name: o.distributor_name, item_count: Number(o.item_count) }),
+  ...(o.retailer_name !== undefined && { retailer_name: o.retailer_name, distributor_name: o.distributor_name, item_count: Number(o.item_count), salesperson_name: o.salesperson_name ?? null, assigned_employee_name: o.assigned_employee_name ?? null, assigned_employee_kind: o.assigned_employee_kind ?? null }),
   ...(items && { items: items.map((i) => ({ product_id: i.product_id, name: i.name, qty: i.qty, ordered_qty: i.ordered_qty ?? i.qty, unit_price: fromPaise(Number(i.unit_price_paise)), gst_rate_bps: i.gst_rate_bps, line_total: fromPaise(Number(i.line_total_paise)),
     standard_unit_price: i.standard_unit_price_paise == null ? null : fromPaise(Number(i.standard_unit_price_paise)), price_list: i.price_list_name ?? null, price_basis: i.price_basis ?? null })) }),
 });
@@ -49,11 +49,13 @@ orderRouter.post('/', requireRole('retailer'), asyncHandler(async (req, res) => 
     items: z.array(z.object({ product_id: z.number().int().positive(), qty: z.number().int().min(1).max(100000) })).min(1).max(100),
     // credit = on the khata account (as always); cod = the retailer pays cash to the delivery person when the order arrives
     payment_method: z.enum(['credit', 'cod']).default('credit'),
+    // gst = GST bill (needs the shop's GSTIN to be useful); plain = a shopkeeper without GST who does not want a GST bill
+    bill_type: z.enum(['gst', 'plain']).default('gst'),
   }).parse(req.body);
   const key = idempotencyKey(req);
   const retailerId = req.auth!.userId;
   // Fingerprint of what was asked for, so reusing a key for a DIFFERENT cart is rejected instead of silently returning the old order.
-  const fingerprint = crypto.createHash('sha256').update(JSON.stringify({ d: b.distributor_id, pm: b.payment_method, i: [...b.items].sort((x, y) => x.product_id - y.product_id) })).digest('hex');
+  const fingerprint = crypto.createHash('sha256').update(JSON.stringify({ d: b.distributor_id, pm: b.payment_method, bt: b.bill_type, i: [...b.items].sort((x, y) => x.product_id - y.product_id) })).digest('hex');
   const replay = (existing: any) => {
     if (existing.request_hash && existing.request_hash !== fingerprint)
       throw new AppError(422, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key was already used with a different order');
@@ -131,6 +133,7 @@ orderRouter.post('/', requireRole('retailer'), asyncHandler(async (req, res) => 
       lines.map((l) => { const cm = commission?.get(l.p.id); return [o.insertId, l.p.id, displayName(l.p).slice(0, 190), l.qty, l.unit, l.p.gst_rate_bps, l.line, l.priced.standard_paise, l.priced.list_id, l.priced.list_name, l.priced.basis, cm?.mode ?? null, cm?.value ?? null, cm?.rule_id ?? null]; }),
     ]);
     await exec(c, "INSERT INTO order_events (order_id, from_status, to_status, actor_id) VALUES (?,NULL,'placed',?)", [o.insertId, retailerId]);
+    if (b.bill_type === 'plain') await exec(c, "UPDATE orders SET bill_type = 'plain' WHERE id = ?", [o.insertId]);
     return { order: await q1<any>(c, 'SELECT * FROM orders WHERE id = ?', [o.insertId]), replayed: false };
   }).catch(async (e) => {
     if (e?.code === 'ER_DUP_ENTRY') return replay(await q1<any>(pool, 'SELECT * FROM orders WHERE retailer_id = ? AND idempotency_key = ?', [retailerId, key]));
@@ -160,7 +163,7 @@ orderRouter.get('/', asyncHandler(async (req, res) => {
   if (qs.status) { extra += ' AND o.status = ?'; args.push(qs.status); }
   if (qs.before) { extra += ' AND o.id < ?'; args.push(qs.before); }
   if (qs.outside) extra += ' AND o.is_out_of_hierarchy = 1';
-  const rows = await q<any>(pool, `SELECT o.*, rp.shop_name AS retailer_name, dp.business_name AS distributor_name, (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count FROM orders o JOIN retailer_profiles rp ON rp.user_id = o.retailer_id JOIN distributor_profiles dp ON dp.user_id = o.distributor_id WHERE ${w}${extra} ORDER BY o.id DESC LIMIT ?`, [...args, qs.limit + 1]);
+  const rows = await q<any>(pool, `SELECT o.*, rp.shop_name AS retailer_name, dp.business_name AS distributor_name, (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count, (SELECT ae.name FROM users ae WHERE ae.id = o.assigned_employee_id) AS assigned_employee_name, (SELECT ae.employee_kind FROM users ae WHERE ae.id = o.assigned_employee_id) AS assigned_employee_kind, (SELECT sp.name FROM users rr JOIN users sp ON sp.id = rr.managed_by_id WHERE rr.id = o.retailer_id) AS salesperson_name FROM orders o JOIN retailer_profiles rp ON rp.user_id = o.retailer_id JOIN distributor_profiles dp ON dp.user_id = o.distributor_id WHERE ${w}${extra} ORDER BY o.id DESC LIMIT ?`, [...args, qs.limit + 1]);
   const page = rows.slice(0, qs.limit);
   // has_more / next_before let the app load older orders instead of silently stopping at the newest page
   res.json({ orders: page.map((r) => present(r)), has_more: rows.length > qs.limit, next_before: rows.length > qs.limit ? page[page.length - 1].id : null });
@@ -168,7 +171,7 @@ orderRouter.get('/', asyncHandler(async (req, res) => {
 
 orderRouter.get('/:id', asyncHandler(async (req, res) => {
   const [w, p] = scopeWhere(req.auth!);
-  const o = await q1<any>(pool, `SELECT o.*, rp.shop_name AS retailer_name, dp.business_name AS distributor_name, (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count FROM orders o JOIN retailer_profiles rp ON rp.user_id = o.retailer_id JOIN distributor_profiles dp ON dp.user_id = o.distributor_id WHERE o.id = ? AND ${w}`, [idParam(req), ...p]);
+  const o = await q1<any>(pool, `SELECT o.*, rp.shop_name AS retailer_name, dp.business_name AS distributor_name, (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count, (SELECT ae.name FROM users ae WHERE ae.id = o.assigned_employee_id) AS assigned_employee_name, (SELECT ae.employee_kind FROM users ae WHERE ae.id = o.assigned_employee_id) AS assigned_employee_kind, (SELECT sp.name FROM users rr JOIN users sp ON sp.id = rr.managed_by_id WHERE rr.id = o.retailer_id) AS salesperson_name FROM orders o JOIN retailer_profiles rp ON rp.user_id = o.retailer_id JOIN distributor_profiles dp ON dp.user_id = o.distributor_id WHERE o.id = ? AND ${w}`, [idParam(req), ...p]);
   if (!o) throw notFound('Order');
   const items = await q(pool, 'SELECT * FROM order_items WHERE order_id = ?', [o.id]);
   const events = await q(pool, 'SELECT from_status, to_status, actor_id, created_at FROM order_events WHERE order_id = ? ORDER BY id', [o.id]);
@@ -290,7 +293,7 @@ orderRouter.post('/:id/transition', asyncHandler(async (req, res) => {
 
 // Assign / reassign delivery employee. Allowed until the order is delivered.
 orderRouter.post('/:id/assign', requireRole('distributor'), asyncHandler(async (req, res) => {
-  const { employee_id } = z.object({ employee_id: z.number().int().positive() }).parse(req.body);
+  const { employee_id, deliver_on } = z.object({ employee_id: z.number().int().positive(), deliver_on: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use a date like 2026-11-15').optional() }).parse(req.body);
   const updated = await withTx(async (c) => {
     const o = await q1<any>(c, 'SELECT * FROM orders WHERE id = ? AND distributor_id = ? FOR UPDATE', [idParam(req), req.auth!.userId]);
     if (!o) throw notFound('Order');
@@ -299,10 +302,10 @@ orderRouter.post('/:id/assign', requireRole('distributor'), asyncHandler(async (
     const e = await q1<any>(c, "SELECT id, is_available FROM users WHERE id = ? AND role = 'employee' AND owner_distributor_id = ? AND is_active = 1", [employee_id, req.auth!.userId]);
     if (!e) throw notFound('Employee');
     if (!e.is_available) throw new AppError(409, 'EMPLOYEE_UNAVAILABLE', 'That person is marked unavailable. Pick someone else, or mark them available again.');
-    await exec(c, 'UPDATE orders SET assigned_employee_id = ? WHERE id = ?', [employee_id, o.id]);
-    await exec(c, "INSERT INTO audit_log (actor_id, action, entity, entity_id, meta) VALUES (?, 'order.assign', 'order', ?, ?)", [req.auth!.userId, o.id, JSON.stringify({ from: o.assigned_employee_id, to: employee_id })]);
+    await exec(c, 'UPDATE orders SET assigned_employee_id = ?, deliver_on = COALESCE(?, deliver_on) WHERE id = ?', [employee_id, deliver_on ?? null, o.id]);
+    await exec(c, "INSERT INTO audit_log (actor_id, action, entity, entity_id, meta) VALUES (?, 'order.assign', 'order', ?, ?)", [req.auth!.userId, o.id, JSON.stringify({ from: o.assigned_employee_id, to: employee_id, deliver_on: deliver_on ?? null })]);
     return q1<any>(c, 'SELECT * FROM orders WHERE id = ?', [o.id]);
   });
-  notifyUsers([employee_id], 'Delivery assigned', `Order #${updated.id}`, { type: 'order', id: updated.id });
+  notifyUsers([employee_id], 'Delivery assigned', `Order #${updated.id}${deliver_on ? ` · deliver on ${deliver_on}` : ''}`, { type: 'order', id: updated.id });
   res.json(present(updated));
 }));

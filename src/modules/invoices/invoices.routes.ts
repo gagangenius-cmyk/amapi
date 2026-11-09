@@ -42,6 +42,7 @@ invoiceRouter.get('/orders/:id/invoice', asyncHandler(async (req, res) => {
   const items = await q<any>(pool, 'SELECT oi.*, p.hsn FROM order_items oi LEFT JOIN products p ON p.id = oi.product_id WHERE oi.order_id = ? AND oi.qty > 0', [id]);
   const accepted = await q1<any>(pool, "SELECT created_at FROM order_events WHERE order_id = ? AND to_status = 'accepted' ORDER BY id LIMIT 1", [id]);
 
+  const plain = o.bill_type === 'plain';   // shopkeeper without GST: a simple bill with all-inclusive rates
   let taxable = 0;
   let gst = 0;
   const rows = items.map((i) => {
@@ -49,6 +50,7 @@ invoiceRouter.get('/orders/:id/invoice', asyncHandler(async (req, res) => {
     const tax = Number(i.line_total_paise) - base;
     taxable += base;
     gst += tax;
+    if (plain) return `<tr><td>${esc(i.name)}</td><td class="r">${i.qty}</td><td class="r">${fromPaise(Math.round(Number(i.line_total_paise) / i.qty))}</td><td class="r">${fromPaise(Number(i.line_total_paise))}</td></tr>`;
     return `<tr><td>${esc(i.name)}</td><td>${esc(i.hsn)}</td><td class="r">${i.qty}</td><td class="r">${fromPaise(Number(i.unit_price_paise))}</td>
       <td class="r">${fromPaise(base)}</td><td class="r">${i.gst_rate_bps / 100}%</td><td class="r">${fromPaise(tax)}</td><td class="r">${fromPaise(Number(i.line_total_paise))}</td></tr>`;
   }).join('');
@@ -71,12 +73,12 @@ invoiceRouter.get('/orders/:id/invoice', asyncHandler(async (req, res) => {
 th,td{border-bottom:1px solid #ddd;padding:6px;text-align:left;font-size:13px}.r{text-align:right}.tot td{font-weight:700;border-top:2px solid #0B1F3A}
 .row{display:flex;justify-content:space-between;gap:24px;margin-top:12px}.muted{color:#6B7788;font-size:12px}@media print{button{display:none}}</style></head><body>
 <button onclick="window.print()">Print / Save as PDF</button>
-<h1>TAX INVOICE</h1><div class="muted">${invoiceNo} &middot; ${esc(date)}</div>
+<h1>${plain ? 'BILL' : 'TAX INVOICE'}</h1><div class="muted">${invoiceNo} &middot; ${esc(date)}</div>
 ${o.irn ? `<div class="muted">IRN: ${esc(o.irn)}<br>Ack no: ${esc(o.irn_ack_no)}${o.irn_ack_at ? ' &middot; ' + esc(new Date(o.irn_ack_at).toLocaleDateString('en-IN')) : ''}</div>` : ''}${o.eway_bill_no ? `<div class="muted">E-way bill: ${esc(o.eway_bill_no)}</div>` : ''}
 <div class="row"><div><b>${esc(o.business_name)}</b><br>GSTIN: ${esc(o.gst_no ?? 'Not registered')}</div>
-<div><b>Bill to</b><br>${esc(o.shop_name)}${o.retailer_gst_no ? '<br>GSTIN: ' + esc(o.retailer_gst_no) : ''}<br>${esc(o.address ?? '')} ${esc(o.pincode)}<br>${esc(o.retailer_phone)}</div></div>
-<table><tr><th>Item</th><th>HSN</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Taxable</th><th class="r">GST</th><th class="r">GST amt</th><th class="r">Amount</th></tr>${rows}
-<tr class="tot"><td colspan="4">Total</td><td class="r">${fromPaise(taxable)}</td><td></td><td class="r">${fromPaise(gst)}</td><td class="r">${fromPaise(Number(o.total_paise))}</td></tr></table>
-<p class="muted">${esc(taxNote)}<br>Amounts in INR. This is a computer-generated invoice.</p>
+<div><b>Bill to</b><br>${esc(o.shop_name)}${!plain && o.retailer_gst_no ? '<br>GSTIN: ' + esc(o.retailer_gst_no) : ''}<br>${esc(o.address ?? '')} ${esc(o.pincode)}<br>${esc(o.retailer_phone)}</div></div>
+<table>${plain ? '<tr><th>Item</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr>' : '<tr><th>Item</th><th>HSN</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Taxable</th><th class="r">GST</th><th class="r">GST amt</th><th class="r">Amount</th></tr>'}${rows}
+${plain ? `<tr class="tot"><td colspan="3">Total</td><td class="r">${fromPaise(Number(o.total_paise))}</td></tr>` : `<tr class="tot"><td colspan="4">Total</td><td class="r">${fromPaise(taxable)}</td><td></td><td class="r">${fromPaise(gst)}</td><td class="r">${fromPaise(Number(o.total_paise))}</td></tr>`}</table>
+<p class="muted">${plain ? '' : esc(taxNote) + '<br>'}Amounts in INR. This is a computer-generated ${plain ? 'bill' : 'invoice'}.</p>
 </body></html>`);
 }));

@@ -39,6 +39,8 @@ export interface PostInput {
   gatewayEventId?: string | null;
   reversalOf?: number | null;
   notes?: string | null;
+  receiptNo?: string | null;
+  upiRef?: string | null;
 }
 
 /**
@@ -78,12 +80,12 @@ export async function postLedger(c: Conn, i: PostInput) {
     c,
     `INSERT INTO ledger_transactions
      (distributor_id, retailer_id, order_id, type, amount_paise, delta_paise, balance_after_paise, payment_mode,
-      cash_denominations, gateway_event_id, reversal_of, notes, created_by, idempotency_key)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      cash_denominations, gateway_event_id, reversal_of, notes, created_by, idempotency_key, receipt_no, upi_ref)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       i.distributorId, i.retailerId, i.orderId ?? null, i.type, i.amountPaise, delta, balanceAfter, i.paymentMode ?? null,
       i.denominations ? JSON.stringify(i.denominations) : null, i.gatewayEventId ?? null, i.reversalOf ?? null, i.notes ?? null,
-      i.createdBy, i.idempotencyKey,
+      i.createdBy, i.idempotencyKey, i.receiptNo ?? null, i.upiRef ?? null,
     ],
   );
   await exec(c, 'UPDATE retailer_distributor_relations SET balance_due_paise = ? WHERE id = ?', [balanceAfter, rel.id]);
