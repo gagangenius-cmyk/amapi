@@ -263,6 +263,23 @@ catalogRouter.get('/taxonomy', requireRole('distributor', 'employee'), asyncHand
   res.json({ categories, brands, restricted: limited !== null });
 }));
 
+// A distributor adds a sub-category under one of their categories. It works at once and waits for the admin to approve it (like a typed-in category).
+catalogRouter.post('/categories', ...writer, asyncHandler(async (req, res) => {
+  const b = z.object({ name: z.string().trim().min(1).max(80), parent_id: z.number().int().positive() }).parse(req.body);
+  const d = req.auth!.userId;
+  await assertSubscriptionActive(pool, d);
+  const limited = await listableCategories(pool, d);
+  const parent = limited ? limited.find((c) => c.id === b.parent_id) : await q1<any>(pool, "SELECT id FROM categories WHERE id = ? AND status <> 'retired'", [b.parent_id]);
+  if (!parent) throw new AppError(400, 'BAD_PARENT', 'Choose one of your categories to add under');
+  const name = b.name.replace(/\s+/g, ' ');
+  const key = name.toLowerCase();
+  const dup = await q1<any>(pool, "SELECT id, name, parent_id, status FROM categories WHERE parent_key = ? AND name_key = ?", [b.parent_id, key]);
+  if (dup) { res.json({ id: dup.id, name: dup.name, parent_id: dup.parent_id, status: dup.status }); return; }
+  const r = await exec(pool, "INSERT INTO categories (name, name_key, parent_id, parent_key, status, created_by) VALUES (?,?,?,?, 'pending', ?)", [name, key, b.parent_id, b.parent_id, d]);
+  await audit(d, 'catalog.subcategory_create', 'category', r.insertId, { name, parent_id: b.parent_id });
+  res.status(201).json({ id: r.insertId, name, parent_id: b.parent_id, status: 'pending' });
+}));
+
 catalogRouter.get('/lookup', requireRole('distributor', 'employee'), asyncHandler(async (req, res) => {
   const { barcode } = z.object({ barcode: z.string().trim().min(1).max(40) }).parse(req.query);
   const p = await q1<any>(pool, 'SELECT * FROM products WHERE distributor_id = ? AND barcode IN (?) AND deleted_at IS NULL', [req.auth!.distributorId, barcodeForms(barcode)]);
@@ -276,7 +293,7 @@ const OFF_HOSTS = ['world.openfoodfacts.org', 'world.openbeautyfacts.org', 'worl
 const IMAGE_HOSTS = ['openfoodfacts.org', 'openbeautyfacts.org', 'openproductsfacts.org'];
 const firstOf = (v: unknown) => String(v ?? '').split(',')[0].trim();
 const getJson = async (url: string) => {
-  const r = await fetch(url, { signal: AbortSignal.timeout(3500), headers: { 'User-Agent': 'AAYME-B2B/1.0 (barcode lookup)', Accept: 'application/json' } });
+  const r = await fetch(url, { signal: AbortSignal.timeout(6000), headers: { 'User-Agent': 'AAYME-B2B/1.0 (barcode lookup)', Accept: 'application/json' } });
   return r.ok ? ((await r.json()) as any) : null;
 };
 /** Brand + product name + pack size, without repeating the brand when the product name already starts with it. */
@@ -287,7 +304,8 @@ const tidyName = (brand: string, product: string, quantity: string) => {
   return [withBrand, size && !withBrand.toLowerCase().includes(size.toLowerCase()) ? size : ''].filter(Boolean).join(' ').slice(0, 190);
 };
 async function lookupOnline(barcode: string): Promise<{ source: string; suggestion: Record<string, unknown> } | null> {
-  for (const host of OFF_HOSTS) {
+  // ask all three sites at once (a slow one no longer holds up the others), then take the first that knows the product
+  const hits = await Promise.all(OFF_HOSTS.map(async (host) => {
     try {
       const j = await getJson(`https://${host}/api/v2/product/${encodeURIComponent(barcode)}.json?fields=product_name,product_name_en,brands,quantity,categories,generic_name,ingredients_text,ingredients_text_en,image_front_url,image_url,image_ingredients_url,image_nutrition_url`);
       const p = j?.status === 1 ? j.product : null;
@@ -304,8 +322,11 @@ async function lookupOnline(barcode: string): Promise<{ source: string; suggesti
           category: firstOf(String(p.categories ?? '').split(',').pop()) || firstOf(p.categories) || null, description, image_url: image_urls[0] ?? null, image_urls,
         } };
       }
-    } catch { /* try the next source */ }
-  }
+    } catch { /* this source did not answer */ }
+    return null;
+  }));
+  const hit = hits.find(Boolean);
+  if (hit) return hit;
   try {
     const j = await getJson(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(barcode)}`);
     const p = j?.items?.[0];
@@ -692,6 +713,9 @@ const importRow = z.object({
   min_order_qty: z.coerce.number().int().min(1).optional(),
   low_stock_threshold: z.coerce.number().int().min(0).optional(),
   barcode: z.string().trim().regex(/^[A-Za-z0-9-]{4,40}$/, 'Barcode is 4 to 40 letters, digits or dashes').optional().or(z.literal('').transform(() => undefined)),
+  cost: money.nullable().optional(),                              // purchase price, private to the distributor
+  weight_g: z.coerce.number().int().min(0).max(10_000_000).optional(),
+  active: z.string().trim().toLowerCase().transform((v) => !['inactive', 'no', 'n', '0', 'false', 'hidden'].includes(v)).optional(),
 });
 
 // Add many products at once (rows come from a spreadsheet/CSV). Valid rows are saved; invalid ones are reported by row number.
@@ -737,6 +761,9 @@ catalogRouter.post('/import/rows', ...writer, asyncHandler(async (req, res) => {
             r.name, r.barcode ?? existing.barcode, r.category ?? existing.category, r.brand ?? existing.brand, r.unit || existing.unit, r.description ?? existing.description, price, mrp ?? existing.mrp_paise,
             r.hsn ?? existing.hsn, r.gst === undefined ? existing.gst_rate_bps : gstBps, r.min_order_qty ?? existing.min_order_qty, r.low_stock_threshold ?? existing.low_stock_threshold, existing.id]);
           await recordPrice(c, existing.id, Number(existing.price_paise), price, d);
+          if (r.cost != null && r.cost !== '') await exec(c, 'UPDATE products SET cost_paise = ? WHERE id = ?', [toPaise(r.cost), existing.id]);
+          if (r.weight_g !== undefined) await exec(c, 'UPDATE products SET weight_g = ? WHERE id = ?', [r.weight_g, existing.id]);
+          if (r.active !== undefined) await exec(c, 'UPDATE products SET is_active = ? WHERE id = ?', [r.active ? 1 : 0, existing.id]);
           if (r.stock !== undefined && r.stock !== existing.stock_qty) await changeStock(c, { productId: existing.id, distributorId: d, delta: r.stock - existing.stock_qty, reason: 'import', actorId: d });
           await syncProduct(c, existing.id, d, 'import_update');
           updated++;
@@ -744,6 +771,9 @@ catalogRouter.post('/import/rows', ...writer, asyncHandler(async (req, res) => {
           const ins = await exec(c, `INSERT INTO products (distributor_id, name, sku, barcode, category, brand, unit, description, price_paise, mrp_paise, stock_qty, min_order_qty, low_stock_threshold, hsn, gst_rate_bps, is_active)
             VALUES (?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,1)`, [d, r.name, r.sku ?? null, r.barcode ?? null, r.category ?? null, r.brand ?? null, r.unit || 'pcs', r.description ?? null, price, mrp, r.min_order_qty ?? 1, r.low_stock_threshold ?? 10, r.hsn ?? null, gstBps]);
           await recordPrice(c, ins.insertId, null, price, d);
+          if (r.cost != null && r.cost !== '') await exec(c, 'UPDATE products SET cost_paise = ? WHERE id = ?', [toPaise(r.cost), ins.insertId]);
+          if (r.weight_g) await exec(c, 'UPDATE products SET weight_g = ? WHERE id = ?', [r.weight_g, ins.insertId]);
+          if (r.active === false) await exec(c, 'UPDATE products SET is_active = 0 WHERE id = ?', [ins.insertId]);
           if (r.stock) await changeStock(c, { productId: ins.insertId, distributorId: d, delta: r.stock, reason: 'import', actorId: d });
           await syncProduct(c, ins.insertId, d, 'import_create');
           created++;

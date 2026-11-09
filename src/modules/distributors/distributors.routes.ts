@@ -252,6 +252,26 @@ distributorRouter.get('/retailers', requireRole('distributor', 'employee'), asyn
   res.json({ retailers: rows, pending });
 }));
 
+// Put many of this distributor's retailers under another team member (or back under the distributor with employee_id null):
+// either the chosen retailers, or everyone a given team member looks after now.
+distributorRouter.put('/retailers/bulk-manager', requireRole('distributor'), asyncHandler(async (req, res) => {
+  const b = z.object({
+    employee_id: z.number().int().positive().nullable(),
+    retailer_ids: z.array(z.number().int().positive()).min(1).max(1000).optional(),
+    from_employee_id: z.number().int().positive().optional(),
+  }).refine((v) => v.retailer_ids || v.from_employee_id, 'Choose retailers, or the team member to move them from').parse(req.body);
+  const d = req.auth!.userId;
+  if (b.employee_id && !(await q1(pool, "SELECT 1 FROM users WHERE id = ? AND role = 'employee' AND owner_distributor_id = ? AND is_active = 1", [b.employee_id, d]))) throw notFound('Team member');
+  // only retailers that really are this distributor's
+  const ours = "SELECT retailer_id FROM retailer_distributor_relations WHERE distributor_id = ? AND status = 'active'";
+  const r = b.retailer_ids
+    ? await exec(pool, `UPDATE users SET managed_by_id = ? WHERE role = 'retailer' AND id IN (?) AND id IN (${ours})`, [b.employee_id, b.retailer_ids, d])
+    : await exec(pool, `UPDATE users SET managed_by_id = ? WHERE role = 'retailer' AND managed_by_id = ? AND id IN (${ours})`, [b.employee_id, b.from_employee_id, d]);
+  await audit(d, 'retailer.bulk_reassign', 'user', null, { to: b.employee_id, from: b.from_employee_id ?? null, moved: r.affectedRows });
+  if (b.employee_id && r.affectedRows) notifyUsers([b.employee_id], 'Retailers assigned', `${r.affectedRows} retailer${r.affectedRows === 1 ? '' : 's'} now sit under you`, { type: 'link' });
+  res.json({ moved: r.affectedRows });
+}));
+
 // Which categories a retailer may see prices for and order from. A retailer with none sees everything this distributor sells.
 distributorRouter.put('/retailers/:retailerId/categories', requireRole('distributor'), asyncHandler(async (req, res) => {
   const { category_ids } = z.object({ category_ids: z.array(z.number().int().positive()).max(30) }).parse(req.body);

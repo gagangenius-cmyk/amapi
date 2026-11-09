@@ -34,6 +34,22 @@ adminRouter.get('/distributors', asyncHandler(async (_req, res) => {
 
 // The admin does not open distributor accounts: a company employee onboards them, and the account appears once the subscription
 // fee has been received (see /onboarding). The admin watches, confirms UPI payments, and can hand a distributor to another employee.
+// Move many distributors to another company employee in one go: either the chosen ones, or everyone a given employee looks after.
+adminRouter.put('/distributors/bulk-employee', asyncHandler(async (req, res) => {
+  const b = z.object({
+    employee_id: z.number().int().positive(),
+    distributor_ids: z.array(z.number().int().positive()).min(1).max(500).optional(),
+    from_employee_id: z.number().int().positive().optional(),
+  }).refine((v) => v.distributor_ids || v.from_employee_id, 'Choose distributors, or the employee to move them from').parse(req.body);
+  const e = await q1<any>(pool, "SELECT id, name FROM users WHERE id = ? AND role = 'company_employee' AND is_active = 1", [b.employee_id]);
+  if (!e) throw new AppError(400, 'NOT_AN_EMPLOYEE', 'Choose an active company employee');
+  const r = b.distributor_ids
+    ? await exec(pool, "UPDATE users SET created_by = ? WHERE role = 'distributor' AND id IN (?) AND (created_by IS NULL OR created_by <> ?)", [b.employee_id, b.distributor_ids, b.employee_id])
+    : await exec(pool, "UPDATE users SET created_by = ? WHERE role = 'distributor' AND created_by = ? AND created_by <> ?", [b.employee_id, b.from_employee_id, b.employee_id]);
+  await audit(req.auth!.userId, 'admin.distributor_bulk_reassign', 'user', null, { to: b.employee_id, from: b.from_employee_id ?? null, ids: b.distributor_ids ?? null, moved: r.affectedRows });
+  res.json({ moved: r.affectedRows, employee: e.name });
+}));
+
 adminRouter.put('/distributors/:id/employee', asyncHandler(async (req, res) => {
   const { employee_id } = z.object({ employee_id: z.number().int().positive() }).parse(req.body);
   const id = idParam(req);
