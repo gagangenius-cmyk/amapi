@@ -10,7 +10,7 @@ import { notifyUsers } from '../../services/notify';
 import { AppError, asyncHandler, notFound } from '../../utils/errors';
 import { assertPermission, assertSubscriptionActive, loadDistributor } from './subscription';
 import { mergeSocial, parseSocial, socialInput } from './social';
-import { categoryNames, distributorCategoryIds, retailerCategoryIds, validateCategoryChoice } from '../catalog/scope';
+import { categoryNames, distributorCategoryIds, listableCategories, retailerCategoryIds, validateCategoryChoice } from '../catalog/scope';
 
 export const distributorRouter = Router();
 distributorRouter.use(authenticate);
@@ -291,7 +291,10 @@ distributorRouter.put('/retailers/:retailerId/categories', requireRole('distribu
 distributorRouter.get('/retailers/:retailerId/categories', requireRole('distributor'), asyncHandler(async (req, res) => {
   const d = req.auth!.userId; const rid = idParam(req, 'retailerId');
   if (!(await q1(pool, "SELECT 1 FROM retailer_distributor_relations WHERE retailer_id = ? AND distributor_id = ? AND status = 'active'", [rid, d]))) throw notFound('Retailer');
-  res.json({ categories: await categoryNames(pool, await retailerCategoryIds(pool, rid)), offered: await categoryNames(pool, await distributorCategoryIds(pool, d)) });
+  // what can be offered: the distributor's categories with their sub-categories, or every active category when they were not limited to some
+  const limited = await listableCategories(pool, d);
+  const offered = limited ?? await q<any>(pool, "SELECT id, parent_id, name, status FROM categories WHERE status <> 'retired' ORDER BY sort_order, name");
+  res.json({ categories: await categoryNames(pool, await retailerCategoryIds(pool, rid)), offered, restricted: limited !== null });
 }));
 
 distributorRouter.delete('/retailers/:retailerId', requireRole('distributor'), asyncHandler(async (req, res) => {

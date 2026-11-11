@@ -138,3 +138,44 @@ describe('bulk import with cost, weight and status', () => {
     expect((await q1<any>(pool, "SELECT is_active FROM products WHERE distributor_id = ? AND sku = 'D1'", [d.id]))!.is_active).toBe(0);
   });
 });
+
+describe('choosing categories when adding a retailer', () => {
+  it('offers the distributor’s categories with their sub-categories, to the owner and to a team member', async () => {
+    const a = await admin(); const d = await distributor(a, await staff(a));
+    const sub = (await request(app).post('/api/v1/catalog/categories').set(auth(d.token)).send({ name: 'Sub One', parent_id: d.categoryId }).expect(201)).body;
+    const ownerTax = (await request(app).get('/api/v1/catalog/taxonomy').set(auth(d.token)).expect(200)).body;
+    expect(ownerTax.restricted).toBe(true);
+    expect(ownerTax.categories.map((c: any) => c.id)).toEqual(expect.arrayContaining([d.categoryId, sub.id]));
+
+    const p = phone();
+    await request(app).post('/api/v1/distributor/employees').set(auth(d.token)).send({ phone: p, name: 'Sales One', password: 'password123', kind: 'sales' }).expect(201);
+    const et = await login(p);
+    const empTax = (await request(app).get('/api/v1/catalog/taxonomy').set(auth(et)).expect(200)).body;
+    expect(empTax.categories.map((c: any) => c.id)).toContain(sub.id);
+
+    // the employee adds a retailer with the sub-category; without any category it is refused
+    const body = (over: object) => ({ phone: phone(), name: 'Keeper', password: 'password123', shop_name: 'Shop ' + n, pincode: '400001', ...over });
+    expect((await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(et)).send(body({}))).status).toBe(400);
+    const ok = await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(et)).send(body({ category_ids: [sub.id] })).expect(201);
+    expect(ok.body.category_ids).toEqual([sub.id]);
+
+    // the owner's retailer screen lists the same tree
+    const mgr = (await request(app).get(`/api/v1/distributor/retailers/${ok.body.id}/categories`).set(auth(d.token)).expect(200)).body;
+    expect(mgr.restricted).toBe(true);
+    expect(mgr.offered.map((c: any) => c.id)).toEqual(expect.arrayContaining([d.categoryId, sub.id]));
+    expect(mgr.categories.map((c: any) => c.id)).toEqual([sub.id]);
+  });
+
+  it('a distributor with no categories set up can still pick from every active category, and may pick none', async () => {
+    const a = await admin();
+    const p = phone();
+    const reg = await request(app).post('/api/v1/auth/register').send({ role: 'distributor', phone: p, email: `d${p}@c.test`, name: 'Solo', password: 'password123', business_name: 'Solo ' + p }).expect(201);
+    const t = reg.body.access_token as string;
+    await request(app).post('/api/v1/admin/categories').set(auth(a)).send({ name: 'Open Cat ' + p }).expect(201);
+    const tax = (await request(app).get('/api/v1/catalog/taxonomy').set(auth(t)).expect(200)).body;
+    expect(tax.restricted).toBe(false);
+    expect(tax.categories.some((c: any) => c.name === 'Open Cat ' + p)).toBe(true);
+    const r = await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(t)).send({ phone: phone(), name: 'Keeper', password: 'password123', shop_name: 'Shop ' + n, pincode: '400001' });
+    expect(r.status).toBe(201);
+  });
+});
