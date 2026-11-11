@@ -153,9 +153,9 @@ describe('choosing categories when adding a retailer', () => {
     const empTax = (await request(app).get('/api/v1/catalog/taxonomy').set(auth(et)).expect(200)).body;
     expect(empTax.categories.map((c: any) => c.id)).toContain(sub.id);
 
-    // the employee adds a retailer with the sub-category; without any category it is refused
+    // the employee may add a retailer with a sub-category, or with none at all
     const body = (over: object) => ({ phone: phone(), name: 'Keeper', password: 'password123', shop_name: 'Shop ' + n, pincode: '400001', ...over });
-    expect((await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(et)).send(body({}))).status).toBe(400);
+    expect((await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(et)).send(body({}))).status).toBe(201);
     const ok = await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(et)).send(body({ category_ids: [sub.id] })).expect(201);
     expect(ok.body.category_ids).toEqual([sub.id]);
 
@@ -177,5 +177,18 @@ describe('choosing categories when adding a retailer', () => {
     expect(tax.categories.some((c: any) => c.name === 'Open Cat ' + p)).toBe(true);
     const r = await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(t)).send({ phone: phone(), name: 'Keeper', password: 'password123', shop_name: 'Shop ' + n, pincode: '400001' });
     expect(r.status).toBe(201);
+  });
+});
+
+describe('a distributor whose only category was retired', () => {
+  it('is not stuck on categories when adding a retailer', async () => {
+    const a = await admin(); const d = await distributor(a, await staff(a));
+    const body = () => ({ phone: phone(), name: 'Keeper', password: 'password123', shop_name: 'Shop ' + n, pincode: '400001' });
+    // adding a retailer by hand needs no category, live or retired
+    expect((await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(d.token)).send(body())).status).toBe(201);
+    await request(app).put(`/api/v1/admin/categories/${d.categoryId}`).set(auth(a)).send({ status: 'retired' }).expect(200);
+    const tax = (await request(app).get('/api/v1/catalog/taxonomy').set(auth(d.token)).expect(200)).body;
+    expect(tax.restricted).toBe(false);
+    expect((await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(d.token)).send(body())).status).toBe(201);
   });
 });

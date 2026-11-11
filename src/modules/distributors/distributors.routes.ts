@@ -181,7 +181,7 @@ distributorRouter.post('/retailer-accounts', requireRole('distributor', 'employe
   const distributorId = req.auth!.distributorId!;
   await assertSubscriptionActive(pool, distributorId);
   const offered = await distributorCategoryIds(pool, distributorId);
-  if (offered.length && !(b.category_ids?.length)) throw new AppError(400, 'CATEGORY_REQUIRED', 'Choose the categories this retailer buys from you');
+  // adding a retailer by hand needs no category: with none, the retailer sees everything this distributor sells (categories can still be set later)
   const categories = await validateCategoryChoice(pool, b.category_ids ?? [], offered);
 
   let managedBy: number | null = null;

@@ -24,8 +24,12 @@ export function withDescendants(all: Cat[], ids: number[]): Set<number> {
   return out;
 }
 
+// A distributor's categories that have since been retired no longer count: otherwise a distributor left with only retired ones would
+// be told to "choose a category" while having none to choose from.
 const idsOf = async (c: Conn, table: 'retailer_categories' | 'distributor_categories', col: string, id: number) =>
-  (await q<{ category_id: number }>(c, `SELECT category_id FROM ${table} WHERE ${col} = ?`, [id])).map((r) => r.category_id);
+  (await q<{ category_id: number }>(c, table === 'distributor_categories'
+    ? `SELECT x.category_id FROM ${table} x JOIN categories c ON c.id = x.category_id WHERE x.${col} = ? AND c.status <> 'retired'`
+    : `SELECT category_id FROM ${table} WHERE ${col} = ?`, [id])).map((r) => r.category_id);
 
 /** null = no restriction; otherwise the category ids this retailer may see from this distributor (possibly none). */
 export async function allowedCategoryIds(c: Conn, retailerId: number, distributorId: number): Promise<number[] | null> {

@@ -92,18 +92,18 @@ describe('a retailer only sees prices for the categories it was given', () => {
     expect((await store(R, s.d.id)).products.map((p: any) => p.id)).toEqual([juice.id]);
   });
 
-  it('only categories the distributor deals in can be given, and at least one is required', async () => {
+  it('only categories the distributor deals in can be given; none at all is fine', async () => {
     const s = await shop();
     const other = await makeCategory(app, s.a.token, 'Toys ' + ++k);
     const mk = (b: object) => request(app).post('/api/v1/distributor/retailer-accounts').set(auth(s.d.token)).send({ phone: phone(), name: 'Retailer', password: 'password123', shop_name: 'Shop', pincode: '400001', ...b });
     expect((await mk({ category_ids: [other.id] })).body.error.code).toBe('CATEGORY_NOT_OFFERED');
-    expect((await mk({})).body.error.code).toBe('CATEGORY_REQUIRED');
-    expect((await mk({ category_ids: [] })).body.error.code).toBe('CATEGORY_REQUIRED');
+    expect((await mk({})).status).toBe(201);                       // no category chosen: the retailer sees everything
+    expect((await mk({ category_ids: [] })).status).toBe(201);
     expect((await mk({ category_ids: [999999] })).body.error.code).toBe('BAD_CATEGORY');
     expect((await mk({ category_ids: [s.cats[0].id] })).status).toBe(201);
   });
 
-  it('a team member creating a retailer has to choose categories too, from the same list', async () => {
+  it('a team member can create a retailer with or without categories', async () => {
     const s = await shop();
     const ep = phone();
     await request(app).post('/api/v1/distributor/employees').set(auth(s.d.token)).send({ phone: ep, name: 'Rep', password: 'password123' }).expect(201);
@@ -111,7 +111,7 @@ describe('a retailer only sees prices for the categories it was given', () => {
     const R = await retailer(s, [s.cats[1].id], {}, et);
     const row = await q1<any>(pool, 'SELECT managed_by_id FROM users WHERE id = ?', [R.id]);
     expect(row!.managed_by_id).not.toBeNull();
-    expect((await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(et)).send({ phone: phone(), name: 'Retailer', password: 'password123', shop_name: 'Shop', pincode: '400001' })).body.error.code).toBe('CATEGORY_REQUIRED');
+    expect((await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(et)).send({ phone: phone(), name: 'Retailer', password: 'password123', shop_name: 'Shop', pincode: '400001' })).status).toBe(201);
   });
 
   it('the distributor can change a retailer\'s categories later, and the storefront follows at once', async () => {
