@@ -66,13 +66,13 @@ describe('1. admin creates company employees and decides what they may do', () =
 });
 
 describe('2. a company employee onboards distributors, handing out only the switches the admin gave them', () => {
-  it('onboards a distributor who can sign in once the fee is confirmed; ungranted switches start off', async () => {
+  it('onboards a distributor who can sign in once the fee is confirmed; every switch starts on unless the employee turns one off', async () => {
     const a = await admin();
     const s = (await request(app).post('/api/v1/admin/staff').set(auth(a)).send(staffBody()).expect(201)).body;
     const tok = await login(s.phone);
     const d = await onboardDistributor(app, { token: a }, { token: tok }, { permissions: { chat_enabled: false } });
     const prof = (await request(app).get('/api/v1/distributor/me').set(auth(d.token)).expect(200)).body;
-    expect(prof.permissions).toMatchObject({ chat_enabled: false, khatabook_enabled: true, self_delivery: false, employees_enabled: false, online_payments: false, cod_enabled: false });
+    expect(prof.permissions).toMatchObject({ chat_enabled: false, khatabook_enabled: true, self_delivery: true, employees_enabled: true, online_payments: true, cod_enabled: true });
   });
 
   it('refuses a switch the employee does not hold', async () => {

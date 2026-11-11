@@ -39,8 +39,8 @@ export function resolvePermissions(requested: Record<string, boolean> | undefine
     const denied = wanted.filter(([k]) => !allowed.includes(k)).map(([k]) => k);
     if (denied.length) throw forbidden(`You cannot grant: ${denied.join(', ')}`);
   }
-  // Everything the person may grant starts on, except cash on delivery: that carries financial risk, so it is on only when asked for.
-  const start = base ?? (allowed ? Object.fromEntries(GRANTABLE_KEYS.map((k) => [k, allowed.includes(k) && k !== 'cod_enabled'])) : { ...DEFAULT_PERMISSIONS });
+  // A distributor has full access: every switch starts on (the admin can still turn one off for a particular distributor later).
+  const start = base ?? { ...DEFAULT_PERMISSIONS };
   return { ...start, ...Object.fromEntries(wanted) };
 }
 

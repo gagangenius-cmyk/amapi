@@ -298,8 +298,8 @@ describe('products kept for chosen retailers, and a price list only that retaile
 });
 
 describe('cash on delivery', () => {
-  it('is refused unless the distributor was given it', async () => {
-    const s = await shop();
+  it('is refused when the admin has switched it off for the distributor', async () => {
+    const s = await shop({ permissions: { cod_enabled: false } });
     const p = await product(s, 'Cola', s.cats[0].id);
     const R = await retailer(s, [s.cats[0].id]);
     const r = await order(R, s.d.id, p.id, { payment_method: 'cod' });

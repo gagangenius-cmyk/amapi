@@ -16,7 +16,7 @@ export interface Permissions {
 
 export const DEFAULT_PERMISSIONS: Permissions = {
   self_delivery: true, khatabook_enabled: true, chat_enabled: true, notifications_enabled: true, pincode_selling: true, online_payments: true, employees_enabled: true,
-  cod_enabled: false,   // cash on delivery is switched on per distributor, never by default
+  cod_enabled: true,    // a distributor has full access; the admin can still switch any of these off for one distributor
 };
 
 /** What each switch does, in plain words (shown to the admin). */

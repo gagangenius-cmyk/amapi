@@ -243,7 +243,7 @@ describe('what the employee must provide and may give', () => {
     const withCod = await onboardDistributor(app, a, full, { permissions: { cod_enabled: true, online_payments: true } });
     expect((await request(app).get('/api/v1/distributor/me').set(auth(withCod.token)).expect(200)).body.permissions).toMatchObject({ cod_enabled: true, online_payments: true });
     const bare = await onboardDistributor(app, a, full);
-    expect((await request(app).get('/api/v1/distributor/me').set(auth(bare.token)).expect(200)).body.permissions).toMatchObject({ cod_enabled: false, online_payments: true });   // what the employee may grant starts on, except COD
+    expect((await request(app).get('/api/v1/distributor/me').set(auth(bare.token)).expect(200)).body.permissions).toMatchObject({ cod_enabled: true, online_payments: true });   // a distributor has full access: every switch starts on
     expect((await startOnboarding(app, a, limited, { permissions: { cod_enabled: true } })).res.status).toBe(403);
     expect((await startOnboarding(app, a, limited, { permissions: { online_payments: true } })).res.status).toBe(403);
   });
