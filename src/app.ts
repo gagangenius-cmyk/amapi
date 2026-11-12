@@ -34,6 +34,7 @@ import { distributorRouter } from './modules/distributors/distributors.routes';
 import { ledgerRouter } from './modules/ledger/ledger.routes';
 import { orderRouter } from './modules/orders/orders.routes';
 import { retailerRouter } from './modules/retailers/retailers.routes';
+import { publicRouter } from './modules/public/public.routes';
 import { legalRouter } from './modules/legal/legal.routes';
 import { errorHandler } from './utils/errors';
 import { logger } from './utils/logger';
@@ -96,6 +97,7 @@ export function createApp() {
   app.use('/api/v1/auth', authRouter);
   app.use('/api/v1/distributor', distributorRouter);
   app.use('/api/v1/catalog', catalogRouter);
+  app.use('/api/v1/public', publicRouter); // the public shop window: no login
   app.use('/api/v1/retailer', retailerRouter);
   app.use('/api/v1', invoiceRouter); // before orderRouter: /orders/:id/invoice is reachable via a signed link
   app.use('/api/v1/orders', orderRouter);
