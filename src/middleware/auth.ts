@@ -4,8 +4,8 @@ import { env } from '../config/env';
 import { pool, q1 } from '../db/pool';
 import { AppError, forbidden } from '../utils/errors';
 
-export type Role = 'admin' | 'distributor' | 'employee' | 'retailer' | 'company_employee';
-const ROLES: Role[] = ['admin', 'distributor', 'employee', 'retailer', 'company_employee'];
+export type Role = 'admin' | 'distributor' | 'employee' | 'retailer' | 'company_employee' | 'customer';
+const ROLES: Role[] = ['admin', 'distributor', 'employee', 'retailer', 'company_employee', 'customer'];
 
 export interface AuthCtx {
   userId: number;

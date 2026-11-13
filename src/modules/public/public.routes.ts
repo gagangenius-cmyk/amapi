@@ -1,9 +1,10 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { pool, q } from '../../db/pool';
+import { pool, q, q1 } from '../../db/pool';
 import { env } from '../../config/env';
 import { asyncHandler } from '../../utils/errors';
 import { storefrontProducts } from '../catalog/catalog.routes';
+import { codeFromQr, PLAY_STORE_URL, presentStore, storeLive, storeQrText } from '../store/store.service';
 
 /**
  * The public shop window: list prices of products that distributors have published (active, approved, not kept for chosen
@@ -33,4 +34,13 @@ publicRouter.get('/products', asyncHandler(async (req, res) => {
   }
   all.sort((a, b) => Number(b.stock_qty > 0) - Number(a.stock_qty > 0));
   res.json({ products: all.slice(qs.offset, qs.offset + qs.limit), total: all.length, categories: [...categories].sort() });
+}));
+
+// What a store's QR code points a first-time visitor to: the store's name and where to get the app (the code rides along in the Play Store link).
+publicRouter.get('/store/:code', asyncHandler(async (req, res) => {
+  const code = codeFromQr(String(req.params.code));
+  const s = code ? await q1<any>(pool, 'SELECT * FROM retailer_stores WHERE code = ?', [code]) : null;
+  if (!s || !(await storeLive(pool, s))) { res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Store not found' } }); return; }
+  const st = presentStore(s);
+  res.json({ store: { name: st.name, address: st.address, open_now: st.open_now }, get_the_app: storeQrText(s.code), play_store_url: PLAY_STORE_URL });
 }));

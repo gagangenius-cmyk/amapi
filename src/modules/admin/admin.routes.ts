@@ -20,6 +20,7 @@ import { adminCommissionRouter } from '../commission/commission.routes';
 import { cleanActions, cleanGrantable, effectivePermissions, parseStaffPermissions, STAFF_ACTIONS } from '../staff/permissions';
 import { assertIdentityFree, commissionReport, dupToConflict, listDistributors } from '../staff/staff.service';
 import { adminOnboardingRouter } from '../onboarding/onboarding.routes';
+import { adminRetailerSalesRouter } from '../retailerSales/retailerSales.routes';
 
 export const adminRouter = Router();
 adminRouter.use(authenticate, requireRole('admin'), requireTwoFactor);
@@ -27,6 +28,7 @@ adminRouter.use(adminReportsRouter);
 adminRouter.use(adminCatalogRouter);
 adminRouter.use(adminCommissionRouter);
 adminRouter.use(adminOnboardingRouter);
+adminRouter.use(adminRetailerSalesRouter);
 
 adminRouter.get('/distributors', asyncHandler(async (_req, res) => {
   res.json({ permission_catalog: PERMISSION_CATALOG, distributors: await listDistributors('1=1', []) });

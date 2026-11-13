@@ -35,6 +35,9 @@ import { ledgerRouter } from './modules/ledger/ledger.routes';
 import { orderRouter } from './modules/orders/orders.routes';
 import { retailerRouter } from './modules/retailers/retailers.routes';
 import { publicRouter } from './modules/public/public.routes';
+import { distributorSalesRouter, retailerSubscriptionRouter } from './modules/retailerSales/retailerSales.routes';
+import { storeRouter } from './modules/store/store.routes';
+import { customerRouter } from './modules/store/customer.routes';
 import { legalRouter } from './modules/legal/legal.routes';
 import { errorHandler } from './utils/errors';
 import { logger } from './utils/logger';
@@ -98,6 +101,10 @@ export function createApp() {
   app.use('/api/v1/distributor', distributorRouter);
   app.use('/api/v1/catalog', catalogRouter);
   app.use('/api/v1/public', publicRouter); // the public shop window: no login
+  app.use('/api/v1/store', storeRouter);                              // a retailer's own online store, billing counter and books
+  app.use('/api/v1/customer', customerRouter);                        // end customers: sign up, find stores, order
+  app.use('/api/v1/retailer/subscription', retailerSubscriptionRouter); // before retailerRouter: a retailer reads their own subscription
+  app.use('/api/v1/sales', distributorSalesRouter);                      // distributors sell retailer subscriptions
   app.use('/api/v1/retailer', retailerRouter);
   app.use('/api/v1', invoiceRouter); // before orderRouter: /orders/:id/invoice is reachable via a signed link
   app.use('/api/v1/orders', orderRouter);
