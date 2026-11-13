@@ -12,6 +12,7 @@ import { assertSubscriptionActive } from '../distributors/subscription';
 import { changeStock, loadTiers } from './stock';
 import { todayUtc } from './batches';
 import { EXT, sniffImage, storage } from '../../services/storage';
+import { fetchRemoteImage, RemoteImageError } from '../../services/remoteImage';
 import { idsToNames, listVersions, syncProduct } from './governance';
 import { reservedByProduct } from '../inventory/inventory.service';
 import { effectiveTable, loadRules } from '../pricing/resolver';
@@ -716,7 +717,12 @@ const importRow = z.object({
   cost: money.nullable().optional(),                              // purchase price, private to the distributor
   weight_g: z.coerce.number().int().min(0).max(10_000_000).optional(),
   active: z.string().trim().toLowerCase().transform((v) => !['inactive', 'no', 'n', '0', 'false', 'hidden'].includes(v)).optional(),
+  // photo links: the main picture, and more pictures separated by | (or spaces / commas); downloaded after the products are saved
+  image_url: z.string().trim().max(600).optional(),
+  other_image_urls: z.string().trim().max(3000).optional(),
 });
+const photoLinks = (r: { image_url?: string; other_image_urls?: string }) =>
+  [...new Set([r.image_url, ...(r.other_image_urls ?? '').split(/[|\s,]+/)].map((x) => (x ?? '').trim()).filter(Boolean))].slice(0, MAX_IMAGES);
 
 // Add many products at once (rows come from a spreadsheet/CSV). Valid rows are saved; invalid ones are reported by row number.
 // With upsert, a row whose SKU already exists updates that product instead of creating a duplicate.
@@ -749,6 +755,7 @@ catalogRouter.post('/import/rows', ...writer, asyncHandler(async (req, res) => {
   if (b.all_or_nothing && errors.length) return res.status(422).json({ created: 0, updated: 0, errors });
 
   let created = 0; let updated = 0;
+  const productOfRow = new Map<number, { id: number; fresh: boolean }>();
   await withTx(async (c) => {
     for (const { n, r } of unique) {
       const price = toPaise(r.price);
@@ -766,6 +773,7 @@ catalogRouter.post('/import/rows', ...writer, asyncHandler(async (req, res) => {
           if (r.active !== undefined) await exec(c, 'UPDATE products SET is_active = ? WHERE id = ?', [r.active ? 1 : 0, existing.id]);
           if (r.stock !== undefined && r.stock !== existing.stock_qty) await changeStock(c, { productId: existing.id, distributorId: d, delta: r.stock - existing.stock_qty, reason: 'import', actorId: d });
           await syncProduct(c, existing.id, d, 'import_update');
+          productOfRow.set(n, { id: existing.id, fresh: false });
           updated++;
         } else {
           const ins = await exec(c, `INSERT INTO products (distributor_id, name, sku, barcode, category, brand, unit, description, price_paise, mrp_paise, stock_qty, min_order_qty, low_stock_threshold, hsn, gst_rate_bps, is_active)
@@ -776,6 +784,7 @@ catalogRouter.post('/import/rows', ...writer, asyncHandler(async (req, res) => {
           if (r.active === false) await exec(c, 'UPDATE products SET is_active = 0 WHERE id = ?', [ins.insertId]);
           if (r.stock) await changeStock(c, { productId: ins.insertId, distributorId: d, delta: r.stock, reason: 'import', actorId: d });
           await syncProduct(c, ins.insertId, d, 'import_create');
+          productOfRow.set(n, { id: ins.insertId, fresh: true });
           created++;
         }
       } catch (e: any) {
@@ -787,5 +796,27 @@ catalogRouter.post('/import/rows', ...writer, asyncHandler(async (req, res) => {
     await audit(d, 'catalog.import', 'product', null, { created, updated, errors: errors.length }, c);
   });
   errors.sort((a, b2) => a.row - b2.row);
-  res.json({ created, updated, errors });
+  // photos are fetched after the products are safely saved; a picture that cannot be fetched never undoes its product
+  let photosAdded = 0;
+  const jobs = unique.map(({ n, r }) => ({ n, links: photoLinks(r), product: productOfRow.get(n) })).filter((j) => j.product && j.links.length);
+  const doJob = async (j: (typeof jobs)[number]) => {
+    const pid = j.product!.id;
+    // a product that already has photos keeps them (importing the same file again must not pile up copies)
+    if (!j.product!.fresh && Number((await q1<any>(pool, 'SELECT COUNT(*) n FROM product_images WHERE product_id = ?', [pid]))!.n) > 0) return;
+    let position = 0;
+    for (const link of j.links) {
+      try {
+        const img = await fetchRemoteImage(link);
+        const key = crypto.randomBytes(20).toString('hex');
+        await storage.put(`${key}.${EXT[img.mime]}`, img.bytes, img.mime);
+        await exec(pool, 'INSERT INTO product_images (product_id, distributor_id, file_key, mime, bytes, position) VALUES (?,?,?,?,?,?)', [pid, d, key, img.mime, img.bytes.length, position++]);
+        photosAdded++;
+      } catch (e: any) {
+        errors.push({ row: j.n, message: `photo ${link.length > 60 ? link.slice(0, 57) + '...' : link}: ${e instanceof RemoteImageError ? e.message : 'the picture could not be saved'} (the product itself was saved)` });
+      }
+    }
+  };
+  for (let k = 0; k < jobs.length; k += 5) await Promise.all(jobs.slice(k, k + 5).map(doJob));
+  errors.sort((a, b2) => a.row - b2.row);
+  res.json({ created, updated, photos: photosAdded, errors });
 }));

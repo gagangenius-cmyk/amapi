@@ -192,3 +192,26 @@ describe('a distributor whose only category was retired', () => {
     expect((await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(d.token)).send(body())).status).toBe(201);
   });
 });
+
+describe('a team member’s own dashboard', () => {
+  it('shows their shops, what those owe, and what they collected today; owners and others cannot open it', async () => {
+    const a = await admin(); const d = await distributor(a, await staff(a));
+    const ep = phone();
+    await request(app).post('/api/v1/distributor/employees').set(auth(d.token)).send({ phone: ep, name: 'Sales Dash', password: 'password123', kind: 'sales' }).expect(201);
+    const et = await login(ep);
+
+    const empty = (await request(app).get('/api/v1/distributor/me/dashboard').set(auth(et)).expect(200)).body;
+    expect(empty).toMatchObject({ name: 'Sales Dash', kind: 'sales', deliveries: { open: 0, delivered_today: 0 }, retailers: { count: 0 }, collections: { today: { count: 0 } }, visits: { today: 0 } });
+
+    const ret = (await request(app).post('/api/v1/distributor/retailer-accounts').set(auth(et)).send({ phone: phone(), name: 'Keeper', password: 'password123', shop_name: 'Dash Shop', pincode: '400001' }).expect(201)).body;
+    await request(app).post('/api/v1/ledger/transaction').set(auth(et)).set('Idempotency-Key', 'dash-' + ret.id)
+      .send({ retailer_id: ret.id, transaction_type: 'payment_cash', amount: '700', payment_mode: 'cash', cash_denominations: { '500': 1, '200': 1 }, receipt_no: 'R-1' }).expect(201);
+
+    const dash = (await request(app).get('/api/v1/distributor/me/dashboard').set(auth(et)).expect(200)).body;
+    expect(dash.retailers.count).toBe(1);
+    expect(dash.collections.today).toMatchObject({ total: '700.00', cash: '700.00', upi: '0.00', count: 1 });
+    expect(dash.collections.month.total).toBe('700.00');
+
+    expect((await request(app).get('/api/v1/distributor/me/dashboard').set(auth(d.token))).status).toBe(403);   // the owner has the full dashboards
+  });
+});

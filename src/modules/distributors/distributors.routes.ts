@@ -96,6 +96,54 @@ distributorRouter.post('/employees', requireRole('distributor'), asyncHandler(as
   res.status(201).json({ id: r.insertId, phone: b.phone, name: b.name, kind: b.kind });
 }));
 
+/**
+ * A team member's own dashboard: what they have delivered and still have to deliver, the shops that sit under them (and what those owe),
+ * the orders those shops placed, what they collected, and the visits they made. "Today" and "this month" are Indian time.
+ */
+distributorRouter.get('/me/dashboard', requireRole('employee'), asyncHandler(async (req, res) => {
+  const me = req.auth!.userId; const d = req.auth!.distributorId!;
+  const ist = (col: string) => `CONVERT_TZ(${col}, '+00:00', '+05:30')`;
+  const nowIst = "CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+05:30')";
+  const today = (col: string) => `DATE(${ist(col)}) = DATE(${nowIst})`;
+  const month = (col: string) => `DATE_FORMAT(${ist(col)}, '%Y-%m') = DATE_FORMAT(${nowIst}, '%Y-%m')`;
+  const money = (v: unknown) => fromPaise(Number(v ?? 0));
+
+  const profile = await q1<any>(pool, 'SELECT name, employee_kind FROM users WHERE id = ?', [me]);
+  const open = (await q1<any>(pool, `SELECT COUNT(*) n, COALESCE(SUM(total_paise),0) v, SUM(deliver_on = DATE(${nowIst})) due_today FROM orders
+    WHERE distributor_id = ? AND assigned_employee_id = ? AND status IN ${OPEN}`, [d, me]))!;
+  const delivered = async (when: (c: string) => string) => (await q1<any>(pool, `SELECT COUNT(DISTINCT o.id) n, COALESCE(SUM(o.total_paise),0) v FROM orders o
+    JOIN order_events e ON e.order_id = o.id AND e.to_status = 'delivered' AND e.actor_id = ? WHERE o.distributor_id = ? AND ${when('e.created_at')}`, [me, d]))!;
+  const dToday = await delivered(today); const dMonth = await delivered(month);
+
+  const shops = (await q1<any>(pool, `SELECT COUNT(*) n, COALESCE(SUM(rdr.balance_due_paise),0) due FROM users u
+    JOIN retailer_distributor_relations rdr ON rdr.retailer_id = u.id AND rdr.distributor_id = ? AND rdr.status = 'active'
+    WHERE u.role = 'retailer' AND u.managed_by_id = ?`, [d, me]))!;
+  const sales = async (when: (c: string) => string) => (await q1<any>(pool, `SELECT COUNT(*) n, COALESCE(SUM(o.total_paise),0) v FROM orders o JOIN users r ON r.id = o.retailer_id
+    WHERE o.distributor_id = ? AND r.managed_by_id = ? AND o.status NOT IN ('rejected','cancelled') AND ${when('o.created_at')}`, [d, me]))!;
+  const sToday = await sales(today); const sMonth = await sales(month);
+
+  const collected = async (when: (c: string) => string) => (await q1<any>(pool, `SELECT COALESCE(SUM(t.amount_paise),0) total,
+      COALESCE(SUM(CASE WHEN t.type = 'payment_cash' AND COALESCE(t.payment_mode,'cash') = 'cash' THEN t.amount_paise ELSE 0 END),0) cash,
+      COALESCE(SUM(CASE WHEN t.type = 'payment_online' OR t.payment_mode = 'upi' THEN t.amount_paise ELSE 0 END),0) upi, COUNT(*) n
+    FROM ledger_transactions t WHERE t.distributor_id = ? AND t.created_by = ? AND t.type IN ('payment_cash','payment_online')
+      AND NOT EXISTS (SELECT 1 FROM ledger_transactions x WHERE x.reversal_of = t.id) AND ${when('t.created_at')}`, [d, me]))!;
+  const cToday = await collected(today); const cMonth = await collected(month);
+
+  const visit = async (when: (c: string) => string) => Number((await q1<any>(pool, `SELECT COUNT(*) n FROM visits WHERE distributor_id = ? AND employee_id = ? AND ${when('visited_at')}`, [d, me]))!.n);
+
+  res.json({
+    name: profile?.name ?? '', kind: profile?.employee_kind ?? 'sales',
+    deliveries: { open: Number(open.n), open_value: money(open.v), due_today: Number(open.due_today ?? 0), delivered_today: Number(dToday.n), delivered_month: Number(dMonth.n), delivered_month_value: money(dMonth.v), delivered_today_value: money(dToday.v) },
+    retailers: { count: Number(shops.n), due: money(shops.due) },
+    sales: { today_orders: Number(sToday.n), today_value: money(sToday.v), month_orders: Number(sMonth.n), month_value: money(sMonth.v) },
+    collections: {
+      today: { total: money(cToday.total), cash: money(cToday.cash), upi: money(cToday.upi), count: Number(cToday.n) },
+      month: { total: money(cMonth.total), cash: money(cMonth.cash), upi: money(cMonth.upi), count: Number(cMonth.n) },
+    },
+    visits: { today: await visit(today), month: await visit(month) },
+  });
+}));
+
 const OPEN = "('accepted','dispatched','out_for_delivery')";
 
 // The team with their workload: how many deliveries each has open, and whether they can take more.
