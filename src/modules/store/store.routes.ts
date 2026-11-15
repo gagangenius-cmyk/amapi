@@ -1,8 +1,10 @@
-import { Router } from 'express';
+import crypto from 'crypto';
+import express, { Router } from 'express';
 import { z } from 'zod';
 import { Conn, exec, pool, q, q1, withTx } from '../../db/pool';
 import { authenticate, requireRole } from '../../middleware/auth';
 import { notifyUsers } from '../../services/notify';
+import { EXT, sniffImage, storage } from '../../services/storage';
 import { audit } from '../../utils/audit';
 import { AppError, asyncHandler, notFound } from '../../utils/errors';
 import { idParam } from '../../utils/http';
@@ -95,6 +97,20 @@ storeRouter.get('/dashboard', asyncHandler(async (req, res) => {
 // ---------------------------------------------------------------------------------------------
 // Products
 // ---------------------------------------------------------------------------------------------
+const MAX_PHOTOS = 5;
+const photoUrl = (key: string) => `/api/v1/media/${key}`;
+/** The product, with its photos (the first is the cover, and is also `image_url`). */
+async function withPhotos(rows: any[]) {
+  const ids = rows.map((r) => r.id);
+  const imgs = ids.length ? await q<any>(pool, 'SELECT id, product_id, file_key FROM store_product_images WHERE product_id IN (?) ORDER BY position, id', [ids]) : [];
+  return rows.map((r) => ({ ...presentProduct(r), cost: r.cost_paise == null ? null : money(r.cost_paise), images: imgs.filter((i) => i.product_id === r.id).map((i) => ({ id: i.id, url: photoUrl(i.file_key) })) }));
+}
+/** Keeps `image_url` pointing at the cover photo. */
+async function syncCover(productId: number) {
+  const first = await q1<any>(pool, 'SELECT file_key FROM store_product_images WHERE product_id = ? ORDER BY position, id LIMIT 1', [productId]);
+  if (first) await exec(pool, 'UPDATE store_products SET image_url = ? WHERE id = ?', [photoUrl(first.file_key), productId]);
+  else await exec(pool, "UPDATE store_products SET image_url = NULL WHERE id = ? AND image_url LIKE '/api/v1/media/%'", [productId]);
+}
 const productBody = z.object({
   name: z.string().trim().min(1).max(190), description: optText(1000), brand: optText(80), category: optText(80), unit: z.string().trim().min(1).max(20).default('pcs'),
   barcode: z.string().trim().regex(/^[A-Za-z0-9-]{4,40}$/, 'Barcode is 4 to 40 letters, digits or dashes').nullable().optional(), sku: optText(60),
@@ -111,13 +127,13 @@ storeRouter.get('/products', asyncHandler(async (req, res) => {
   if (qs.status === 'active') where.push('is_active = 1'); else if (qs.status === 'hidden') where.push('is_active = 0'); else if (qs.status === 'low') where.push('stock_qty > 0 AND stock_qty <= 5'); else if (qs.status === 'out') where.push('stock_qty <= 0');
   const rows = await q<any>(pool, `SELECT * FROM store_products WHERE ${where.join(' AND ')} ORDER BY id DESC LIMIT ? OFFSET ?`, [...args, qs.limit, qs.offset]);
   const cats = await q<any>(pool, 'SELECT DISTINCT category FROM store_products WHERE retailer_id = ? AND deleted_at IS NULL AND category IS NOT NULL ORDER BY category', [req.auth!.userId]);
-  res.json({ products: rows.map((p) => ({ ...presentProduct(p), cost: p.cost_paise == null ? null : money(p.cost_paise) })), categories: cats.map((c) => c.category) });
+  res.json({ products: await withPhotos(rows), categories: cats.map((c) => c.category) });
 }));
 
 storeRouter.get('/products/by-barcode/:code', asyncHandler(async (req, res) => {
   const p = await q1<any>(pool, 'SELECT * FROM store_products WHERE retailer_id = ? AND barcode = ? AND deleted_at IS NULL AND is_active = 1', [req.auth!.userId, String(req.params.code)]);
   if (!p) throw notFound('Product');
-  res.json({ ...presentProduct(p), cost: p.cost_paise == null ? null : money(p.cost_paise) });
+  res.json((await withPhotos([p]))[0]);
 }));
 
 storeRouter.post('/products', asyncHandler(async (req, res) => {
@@ -129,7 +145,7 @@ storeRouter.post('/products', asyncHandler(async (req, res) => {
   if (b.barcode && (await q1(pool, 'SELECT 1 FROM store_products WHERE retailer_id = ? AND barcode = ? AND deleted_at IS NULL', [s.retailer_id, b.barcode]))) throw new AppError(409, 'BARCODE_TAKEN', 'Another product of yours already uses this barcode');
   const r = await exec(pool, `INSERT INTO store_products (retailer_id, name, description, brand, category, unit, barcode, sku, price_paise, mrp_paise, cost_paise, gst_rate_bps, stock_qty, image_url, is_active)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [s.retailer_id, b.name, b.description ?? null, b.brand ?? null, b.category ?? null, b.unit, b.barcode ?? null, b.sku ?? null, price, mrp, cost, b.gst_rate_bps, b.stock_qty, b.image_url ?? null, b.is_active ? 1 : 0]);
-  res.status(201).json(presentProduct((await q1<any>(pool, 'SELECT * FROM store_products WHERE id = ?', [r.insertId]))));
+  res.status(201).json((await withPhotos([(await q1<any>(pool, 'SELECT * FROM store_products WHERE id = ?', [r.insertId]))!]))[0]);
 }));
 
 storeRouter.put('/products/:id', asyncHandler(async (req, res) => {
@@ -149,7 +165,46 @@ storeRouter.put('/products/:id', asyncHandler(async (req, res) => {
     pick('name', cur.name), pick('description', cur.description), pick('brand', cur.brand), pick('category', cur.category), pick('unit', cur.unit), barcode, pick('sku', cur.sku), price, mrp, cost,
     pick('gst_rate_bps', cur.gst_rate_bps), pick('stock_qty', cur.stock_qty), pick('image_url', cur.image_url), b.is_active === undefined ? cur.is_active : b.is_active ? 1 : 0, id]);
   const fresh = (await q1<any>(pool, 'SELECT * FROM store_products WHERE id = ?', [id]))!;
-  res.json({ ...presentProduct(fresh), cost: fresh.cost_paise == null ? null : money(fresh.cost_paise) });
+  res.json((await withPhotos([fresh]))[0]);
+}));
+
+// Photos: the raw image bytes are the request body (JPEG, PNG or WebP, up to 4 MB, 5 per product).
+const rawImage = express.raw({ type: ['image/*', 'application/octet-stream'], limit: '4mb' });
+
+storeRouter.post('/products/:id/images', rawImage, asyncHandler(async (req, res) => {
+  const id = idParam(req);
+  if (!Buffer.isBuffer(req.body) || !req.body.length) throw new AppError(415, 'BAD_IMAGE', 'Send a JPEG, PNG or WebP image as the request body (max 4 MB)');
+  const mime = sniffImage(req.body);
+  if (!mime) throw new AppError(415, 'BAD_IMAGE', 'That file is not a valid JPEG, PNG or WebP image');
+  const s = await liveStore(req);
+  if (!(await q1(pool, 'SELECT 1 FROM store_products WHERE id = ? AND retailer_id = ? AND deleted_at IS NULL', [id, s.retailer_id]))) throw notFound('Product');
+  const n = Number((await q1<any>(pool, 'SELECT COUNT(*) n FROM store_product_images WHERE product_id = ?', [id]))!.n);
+  if (n >= MAX_PHOTOS) throw new AppError(409, 'TOO_MANY_IMAGES', `A product can have at most ${MAX_PHOTOS} photos`);
+  const key = crypto.randomBytes(20).toString('hex');
+  await storage.put(`${key}.${EXT[mime]}`, req.body, mime);
+  await exec(pool, 'INSERT INTO store_product_images (product_id, retailer_id, file_key, mime, bytes, position) VALUES (?,?,?,?,?,?)', [id, s.retailer_id, key, mime, req.body.length, n]);
+  await syncCover(id);
+  res.status(201).json({ images: (await withPhotos([(await q1<any>(pool, 'SELECT * FROM store_products WHERE id = ?', [id]))!]))[0].images });
+}));
+
+storeRouter.post('/products/:id/images/:imageId/cover', asyncHandler(async (req, res) => {
+  const id = idParam(req); const imageId = idParam(req, 'imageId');
+  const img = await q1<any>(pool, 'SELECT * FROM store_product_images WHERE id = ? AND product_id = ? AND retailer_id = ?', [imageId, id, req.auth!.userId]);
+  if (!img) throw notFound('Photo');
+  await exec(pool, 'UPDATE store_product_images SET position = position + 1 WHERE product_id = ?', [id]);
+  await exec(pool, 'UPDATE store_product_images SET position = 0 WHERE id = ?', [imageId]);
+  await syncCover(id);
+  res.json({ images: (await withPhotos([(await q1<any>(pool, 'SELECT * FROM store_products WHERE id = ?', [id]))!]))[0].images });
+}));
+
+storeRouter.delete('/products/:id/images/:imageId', asyncHandler(async (req, res) => {
+  const id = idParam(req); const imageId = idParam(req, 'imageId');
+  const img = await q1<any>(pool, 'SELECT * FROM store_product_images WHERE id = ? AND product_id = ? AND retailer_id = ?', [imageId, id, req.auth!.userId]);
+  if (!img) throw notFound('Photo');
+  await exec(pool, 'DELETE FROM store_product_images WHERE id = ?', [imageId]);
+  await storage.remove(`${img.file_key}.${EXT[img.mime as keyof typeof EXT]}`);
+  await syncCover(id);
+  res.json({ images: (await withPhotos([(await q1<any>(pool, 'SELECT * FROM store_products WHERE id = ?', [id]))!]))[0].images });
 }));
 
 storeRouter.delete('/products/:id', asyncHandler(async (req, res) => {

@@ -286,3 +286,54 @@ describe('counter billing and the day book', () => {
     expect((await request(app).get('/api/v1/customer/home').set(auth(c.token))).body.banners.map((x: any) => x.title)).not.toContain('Diwali sale');
   });
 });
+
+describe('store product photos', () => {
+  const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6300010000050001', 'hex');
+  const upload = (r: { token: string }, id: number, body: Buffer = PNG, type = 'image/png') => request(app).post(`/api/v1/store/products/${id}/images`).set(auth(r.token)).set('Content-Type', type).send(body);
+
+  it('adds photos (first is the cover and the product image), changes the cover, deletes, and serves them', async () => {
+    const a = await admin(); const d = await distributor(); const r = await liveRetailer(a, d);
+    const p = (await addProduct(r, { name: 'Photo Item' }).expect(201)).body;
+    expect(p.images).toEqual([]);
+
+    const first = (await upload(r, p.id).expect(201)).body.images;
+    expect(first).toHaveLength(1);
+    const second = (await upload(r, p.id).expect(201)).body.images;
+    expect(second).toHaveLength(2);
+    const listed = (await request(app).get('/api/v1/store/products').set(auth(r.token)).expect(200)).body.products.find((x: any) => x.id === p.id);
+    expect(listed.image_url).toBe(first[0].url);                                    // the cover is the first photo
+    const media = await request(app).get(first[0].url).expect(200);                 // served without a login, like every product photo
+    expect(media.headers['content-type']).toBe('image/png');
+
+    await request(app).post(`/api/v1/store/products/${p.id}/images/${second[1].id}/cover`).set(auth(r.token)).expect(200);
+    const after = (await request(app).get('/api/v1/store/products').set(auth(r.token))).body.products.find((x: any) => x.id === p.id);
+    expect(after.images[0].id).toBe(second[1].id);
+    expect(after.image_url).toBe(second[1].url);
+
+    await request(app).delete(`/api/v1/store/products/${p.id}/images/${second[1].id}`).set(auth(r.token)).expect(200);
+    const gone = (await request(app).get('/api/v1/store/products').set(auth(r.token))).body.products.find((x: any) => x.id === p.id);
+    expect(gone.images).toHaveLength(1); expect(gone.image_url).toBe(gone.images[0].url);
+    await request(app).delete(`/api/v1/store/products/${p.id}/images/${gone.images[0].id}`).set(auth(r.token)).expect(200);
+    expect((await request(app).get('/api/v1/store/products').set(auth(r.token))).body.products.find((x: any) => x.id === p.id).image_url).toBeNull();
+  });
+
+  it('refuses a sixth photo, a file that is not a picture, and another retailer’s product', async () => {
+    const a = await admin(); const d = await distributor(); const r = await liveRetailer(a, d); const other = await liveRetailer(a, d);
+    const p = (await addProduct(r).expect(201)).body;
+    for (let i = 0; i < 5; i++) await upload(r, p.id).expect(201);
+    expect((await upload(r, p.id)).body.error.code).toBe('TOO_MANY_IMAGES');
+    const q2 = (await addProduct(r).expect(201)).body;
+    expect((await upload(r, q2.id, Buffer.from('not a picture at all'), 'application/octet-stream')).status).toBe(415);
+    expect((await upload(other, p.id)).status).toBe(404);
+    expect((await upload(other, 999999)).status).toBe(404);
+  });
+
+  it('customers see the cover photo of a product', async () => {
+    const a = await admin(); const d = await distributor(); const r = await liveRetailer(a, d);
+    const p = (await addProduct(r, { name: 'Pretty Thing' }).expect(201)).body;
+    const img = (await upload(r, p.id).expect(201)).body.images[0];
+    const c = await customer();
+    const menu = (await request(app).get(`/api/v1/customer/stores/${r.id}/products`).set(auth(c.token)).expect(200)).body.products;
+    expect(menu.find((x: any) => x.id === p.id).image_url).toBe(img.url);
+  });
+});
