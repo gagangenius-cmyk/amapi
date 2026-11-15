@@ -77,6 +77,22 @@ accountRouter.delete('/', asyncHandler(async (req, res) => {
       const open = await q1<any>(c, `SELECT COUNT(*) n FROM orders WHERE ${col} = ? AND status IN ('placed','accepted','dispatched','out_for_delivery')`, [a.userId]);
       if (Number(open.n) > 0) throw new AppError(409, 'OPEN_ORDERS', 'Complete or cancel open orders before deleting your account');
     }
+    if (a.role === 'customer') {
+      const open = await q1<any>(c, "SELECT COUNT(*) n FROM store_orders WHERE customer_id = ? AND status IN ('placed','accepted','out_for_delivery')", [a.userId]);
+      if (Number(open.n) > 0) throw new AppError(409, 'OPEN_ORDERS', 'Wait for your open orders to be delivered, or cancel them, before deleting your account');
+      // the stores keep their sales records, but not who you were
+      await exec(c, "UPDATE store_customers SET name = 'Deleted customer', phone = CONCAT('D', id), customer_id = NULL WHERE customer_id = ?", [a.userId]);
+      await exec(c, "UPDATE store_orders SET customer_name = 'Deleted customer', customer_phone = NULL, delivery_address = NULL, lat = NULL, lng = NULL WHERE customer_id = ?", [a.userId]);
+      await exec(c, 'UPDATE customer_profiles SET address = NULL, pincode = NULL, lat = NULL, lng = NULL, pinned_retailer_id = NULL WHERE user_id = ?', [a.userId]);
+    }
+    if (a.role === 'retailer') {
+      const open = await q1<any>(c, "SELECT COUNT(*) n FROM store_orders WHERE retailer_id = ? AND status IN ('placed','accepted','out_for_delivery')", [a.userId]);
+      if (Number(open.n) > 0) throw new AppError(409, 'OPEN_STORE_ORDERS', 'Deliver or cancel your open store orders before deleting your account');
+      // the online store disappears for customers
+      await exec(c, "UPDATE retailer_stores SET is_active = 0, name = 'Deleted shop', description = NULL, phone = NULL, address = NULL, lat = NULL, lng = NULL, upi_id = NULL, upi_payee = NULL, whatsapp_url = NULL, facebook_url = NULL, instagram_url = NULL, youtube_url = NULL WHERE retailer_id = ?", [a.userId]);
+      await exec(c, 'UPDATE store_products SET is_active = 0, deleted_at = UTC_TIMESTAMP() WHERE retailer_id = ? AND deleted_at IS NULL', [a.userId]);
+      await exec(c, 'UPDATE customer_profiles SET pinned_retailer_id = NULL WHERE pinned_retailer_id = ?', [a.userId]);
+    }
     if (a.role === 'distributor') {
       await exec(c, "UPDATE users SET is_active = 0 WHERE owner_distributor_id = ? AND role = 'employee'", [a.userId]);
       await exec(c, 'UPDATE distributor_profiles SET subscription_ends_at = UTC_TIMESTAMP(), bank_account_details = NULL, gst_no = NULL WHERE user_id = ?', [a.userId]);

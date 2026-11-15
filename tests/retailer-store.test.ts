@@ -341,3 +341,36 @@ describe('store product photos', () => {
     expect(menu.find((x: any) => x.id === p.id).image_url).toBe(img.url);
   });
 });
+
+describe('deleting an account', () => {
+  it('removes a customer’s details from the stores but keeps the stores’ sales records', async () => {
+    const a = await admin(); const d = await distributor(); const r = await liveRetailer(a, d);
+    const p = (await addProduct(r, { name: 'Delete Test', price: '60', cost: '40', stock_qty: 10 }).expect(201)).body;
+    await request(app).put('/api/v1/store/me').set(auth(r.token)).send({ min_order: '0' }).expect(200);
+    const c = await customer({ store_code: (await store(r)).store_code });
+    const o = (await request(app).post('/api/v1/customer/orders').set(auth(c.token)).send({ retailer_id: r.id, items: [{ product_id: p.id, qty: 1 }], payment_method: 'cod', address: '5 Lake Road' }).expect(201)).body;
+
+    const blocked = await request(app).delete('/api/v1/me').set(auth(c.token)).send({ password: 'password123' });
+    expect(blocked.status).toBe(409); expect(blocked.body.error.code).toBe('OPEN_ORDERS');
+    await request(app).post(`/api/v1/customer/orders/${o.id}/cancel`).set(auth(c.token)).expect(200);
+    await request(app).delete('/api/v1/me').set(auth(c.token)).send({ password: 'password123' }).expect(204);
+
+    const mine = (await request(app).get('/api/v1/store/customers').set(auth(r.token))).body.customers;
+    expect(mine.map((x: any) => x.phone)).not.toContain(c.phone);
+    expect(mine[0].name).toBe('Deleted customer');
+    const order = await q1<any>(pool, 'SELECT customer_name, customer_phone, delivery_address FROM store_orders WHERE id = ?', [o.id]);
+    expect(order).toMatchObject({ customer_name: 'Deleted customer', customer_phone: null, delivery_address: null });
+  });
+
+  it('takes a deleted retailer’s store off the customers’ screens', async () => {
+    const a = await admin(); const d = await distributor(); const r = await liveRetailer(a, d);
+    const c = await customer({ store_code: (await store(r)).store_code });
+    expect((await request(app).get(`/api/v1/customer/stores/${r.id}`).set(auth(c.token)).expect(200)).body.store.id).toBe(r.id);
+    const dup = await request(app).get('/api/v1/customer/stores').set(auth(c.token));
+    expect(dup.body.stores.map((x: any) => x.id)).toContain(r.id);
+    await request(app).delete('/api/v1/me').set(auth(r.token)).send({ password: 'password123' }).expect(204);
+    expect((await request(app).get(`/api/v1/customer/stores/${r.id}`).set(auth(c.token))).status).toBe(404);
+    expect((await request(app).get('/api/v1/customer/stores').set(auth(c.token))).body.stores.map((x: any) => x.id)).not.toContain(r.id);
+    expect((await request(app).get('/api/v1/customer/home').set(auth(c.token))).body.pinned_store).toBeNull();
+  });
+});

@@ -186,7 +186,7 @@ distributorSalesRouter.post('/sell', asyncHandler(async (req, res) => {
 async function notifyAdmins(saleId: number, distributorId: number) {
   const admins = await q<any>(pool, "SELECT id FROM users WHERE role = 'admin' AND is_active = 1");
   const dp = await q1<any>(pool, 'SELECT business_name FROM distributor_profiles WHERE user_id = ?', [distributorId]);
-  if (admins.length) notifyUsers(admins.map((a) => a.id), 'Subscription payment to confirm', `${dp?.business_name ?? 'A distributor'} submitted a retailer subscription payment (sale #${saleId}).`, { type: 'subscription_sale', id: saleId });
+  if (admins.length) notifyUsers(admins.map((a) => a.id), 'Subscription payment to confirm', `${dp?.business_name ?? 'A distributor'} submitted a retailer subscription payment (sale #${saleId}).`, { type: 'subscription_sale_admin', id: saleId });
 }
 
 // The payment details for a sale that was created before the retailer paid.
@@ -394,7 +394,7 @@ adminRetailerSalesRouter.post('/subscription-sales/:id/confirm', asyncHandler(as
     await audit(admin, 'subscription_sale.confirm', 'subscription_sale', id, { distributor_id: out.sale.distributor_id, retailer_id: out.sale.retailer_id });
     const c = Number(out.sale.commission_paise);
     notifyUsers([out.sale.distributor_id], 'Subscription activated', `Sale #${id} (${out.sale.plan_name}) is confirmed${c > 0 ? `. ₹${money(c)} commission added to your earnings` : ''}.`, { type: 'subscription_sale', id });
-    notifyUsers([out.sale.retailer_id], 'Your AAYME subscription is active', `Your ${out.sale.plan_name} plan is now active.`, { type: 'subscription' });
+    notifyUsers([out.sale.retailer_id], 'Your AAYME subscription is active', `Your ${out.sale.plan_name} plan is now active.`, { type: 'my_plan' });
   }
   res.json({ status: 'paid', replayed: out.replayed });
 }));

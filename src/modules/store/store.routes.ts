@@ -302,7 +302,7 @@ storeRouter.post('/orders/:id/transition', asyncHandler(async (req, res) => {
   });
   if (out.customer_id) {
     const text: Record<string, string> = { accepted: 'Your order was accepted', rejected: 'Your order was rejected', out_for_delivery: 'Your order is on its way', delivered: 'Your order was delivered', cancelled: 'Your order was cancelled' };
-    notifyUsers([out.customer_id], text[to], `Order #${id}`, { type: 'store_order', id });
+    notifyUsers([out.customer_id], text[to], `Order #${id}`, { type: 'customer_order', id });
   }
   res.json({ status: to });
 }));
