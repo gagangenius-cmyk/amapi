@@ -65,15 +65,19 @@ describe('store codes, QR text and helpers', () => {
 });
 
 describe('the retailer’s store', () => {
-  it('can be set up at once, but only sells once the AAYME subscription is active', async () => {
+  it('can be set up at once, but only sells and shows to customers once the AAYME subscription is active', async () => {
     const a = await admin(); const d = await distributor();
     const r = await liveRetailer(a, d, false);
     const me = await store(r);
     expect(me.live).toBe(false);
     expect(me.store_code).toMatch(/^[A-F0-9]{8}$/);
     expect(me.qr_text).toContain(`aayme_store%3D${me.store_code}`);
-    const blocked = await addProduct(r);
-    expect(blocked.status).toBe(402); expect(blocked.body.error.code).toBe('STORE_NOT_ACTIVE');
+    // setting up is allowed before the plan starts; selling is not
+    const early = (await addProduct(r, { barcode: '7777777777' }).expect(201)).body;
+    const bill = await request(app).post('/api/v1/store/pos/bills').set(auth(r.token)).send({ items: [{ product_id: early.id, qty: 1 }], payment_mode: 'cash' });
+    expect(bill.status).toBe(402); expect(bill.body.error.code).toBe('STORE_NOT_ACTIVE');
+    const visitor = await customer();
+    expect((await request(app).get(`/api/v1/customer/stores/${r.id}`).set(auth(visitor.token))).status).toBe(404);      // customers cannot see it yet
 
     const sale = (await q1<any>(pool, 'SELECT id FROM subscription_sales WHERE retailer_id = ?', [r.id]))!;
     await request(app).post(`/api/v1/admin/subscription-sales/${sale.id}/confirm`).set(auth(a)).expect(200);

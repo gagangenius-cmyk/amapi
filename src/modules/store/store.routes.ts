@@ -16,7 +16,8 @@ import { upiUri } from '../subscription/subscription.service';
 
 /*
  * The retailer's own online store, billing counter and books. Everything here is for a signed-in retailer.
- * Reading is always allowed; changing anything needs a live subscription (an active AAYME plan).
+ * A retailer can set up their store (profile, products, photos, offers, customers) at any time. Counter billing, and showing the store to customers
+ * (so online orders can come in), need a live subscription (an active AAYME plan).
  */
 export const storeRouter = Router();
 storeRouter.use(authenticate, requireRole('retailer'));
@@ -137,7 +138,7 @@ storeRouter.get('/products/by-barcode/:code', asyncHandler(async (req, res) => {
 }));
 
 storeRouter.post('/products', asyncHandler(async (req, res) => {
-  const s = await liveStore(req);
+  const s = await myStore(req);
   const b = productBody.parse(req.body);
   const price = toPaise(b.price); const mrp = b.mrp == null || b.mrp === '' ? null : toPaise(b.mrp); const cost = b.cost == null || b.cost === '' ? null : toPaise(b.cost);
   if (price <= 0) throw new AppError(400, 'BAD_PRICE', 'Price must be more than zero');
@@ -149,7 +150,7 @@ storeRouter.post('/products', asyncHandler(async (req, res) => {
 }));
 
 storeRouter.put('/products/:id', asyncHandler(async (req, res) => {
-  const s = await liveStore(req);
+  const s = await myStore(req);
   const b = productBody.partial().parse(req.body); const id = idParam(req);
   const cur = await q1<any>(pool, 'SELECT * FROM store_products WHERE id = ? AND retailer_id = ? AND deleted_at IS NULL', [id, s.retailer_id]);
   if (!cur) throw notFound('Product');
@@ -176,7 +177,7 @@ storeRouter.post('/products/:id/images', rawImage, asyncHandler(async (req, res)
   if (!Buffer.isBuffer(req.body) || !req.body.length) throw new AppError(415, 'BAD_IMAGE', 'Send a JPEG, PNG or WebP image as the request body (max 4 MB)');
   const mime = sniffImage(req.body);
   if (!mime) throw new AppError(415, 'BAD_IMAGE', 'That file is not a valid JPEG, PNG or WebP image');
-  const s = await liveStore(req);
+  const s = await myStore(req);
   if (!(await q1(pool, 'SELECT 1 FROM store_products WHERE id = ? AND retailer_id = ? AND deleted_at IS NULL', [id, s.retailer_id]))) throw notFound('Product');
   const n = Number((await q1<any>(pool, 'SELECT COUNT(*) n FROM store_product_images WHERE product_id = ?', [id]))!.n);
   if (n >= MAX_PHOTOS) throw new AppError(409, 'TOO_MANY_IMAGES', `A product can have at most ${MAX_PHOTOS} photos`);
@@ -225,7 +226,7 @@ storeRouter.get('/distributor-products', asyncHandler(async (req, res) => {
 
 // Copy products from a distributor's catalogue into the store. The retailer's cost is what they pay (with GST); the selling price is cost + markup unless a price is given.
 storeRouter.post('/products/import', asyncHandler(async (req, res) => {
-  const s = await liveStore(req);
+  const s = await myStore(req);
   const b = z.object({ distributor_id: z.number().int().positive(), product_ids: z.array(z.number().int().positive()).min(1).max(100), markup_percent: z.number().min(0).max(500).default(10), stock_qty: z.number().int().min(0).default(0) }).parse(req.body);
   if (!(await storeAccess(pool, s.retailer_id, b.distributor_id))) throw notFound('Distributor');
   const all = await storefrontProducts(b.distributor_id, { limit: 200, retailerId: s.retailer_id });
@@ -259,7 +260,7 @@ storeRouter.get('/customers', asyncHandler(async (req, res) => {
 }));
 storeRouter.post('/customers', asyncHandler(async (req, res) => {
   const b = z.object({ name: z.string().trim().min(2).max(120), phone: z.string().regex(/^\d{10}$/, '10-digit phone') }).parse(req.body);
-  const s = await liveStore(req);
+  const s = await myStore(req);
   const c = await addStoreCustomer(pool, s.retailer_id, { name: b.name, phone: b.phone, source: 'manual' });
   res.status(201).json({ id: c.id, name: c.name, phone: c.phone });
 }));
@@ -435,7 +436,7 @@ storeRouter.get('/reports/sales', asyncHandler(async (req, res) => {
 const offerBody = z.object({ title: z.string().trim().min(2).max(120), description: optText(300), starts_on: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(), ends_on: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(), is_active: z.boolean().default(true) });
 storeRouter.get('/offers', asyncHandler(async (req, res) => { res.json({ offers: await q<any>(pool, 'SELECT id, title, description, starts_on, ends_on, is_active FROM store_offers WHERE retailer_id = ? ORDER BY id DESC', [req.auth!.userId]) }); }));
 storeRouter.post('/offers', asyncHandler(async (req, res) => {
-  const b = offerBody.parse(req.body); const s = await liveStore(req);
+  const b = offerBody.parse(req.body); const s = await myStore(req);
   const r = await exec(pool, 'INSERT INTO store_offers (retailer_id, title, description, starts_on, ends_on, is_active) VALUES (?,?,?,?,?,?)', [s.retailer_id, b.title, b.description ?? null, b.starts_on ?? null, b.ends_on ?? null, b.is_active ? 1 : 0]);
   res.status(201).json(await q1(pool, 'SELECT id, title, description, starts_on, ends_on, is_active FROM store_offers WHERE id = ?', [r.insertId]));
 }));
