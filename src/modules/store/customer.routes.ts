@@ -128,6 +128,63 @@ customerRouter.get('/search', asyncHandler(async (req, res) => {
     products: products.map((p) => ({ ...presentProduct(p), store_id: p.retailer_id, store_name: nameOf.get(p.retailer_id) })) });
 }));
 
+// ---- Browsing like a shopping site: a category menu, products by category, then sub-categories and filters, across the stores near the customer.
+const NEAR_STORES = 60;
+const liveIds = async (req: any, qs: { lat?: number; lng?: number }) => {
+  const stores = await liveStores(await whereOf(req, qs), { limit: NEAR_STORES });
+  return { ids: stores.map((x) => x.s.retailer_id as number), names: new Map<number, string>(stores.map((x) => [x.s.retailer_id as number, x.s.name as string])) };
+};
+const withStore = (names: Map<number, string>) => (p: any) => { const o = presentProduct(p); return { ...o, stock_qty: Math.min(o.stock_qty, 20), store_id: p.retailer_id, store_name: names.get(p.retailer_id) }; };
+
+/** The menu (every category with its sub-categories) and a row of products for the busiest categories. */
+customerRouter.get('/catalog', asyncHandler(async (req, res) => {
+  const { ids, names } = await liveIds(req, coords.parse(req.query));
+  if (!ids.length) return res.json({ categories: [], rails: [] });
+  const rows = await q<any>(pool, `SELECT category, sub_category, COUNT(*) n FROM store_products WHERE retailer_id IN (?) AND deleted_at IS NULL AND is_active = 1 AND category IS NOT NULL GROUP BY category, sub_category`, [ids]);
+  const by = new Map<string, { name: string; products: number; sub_categories: { name: string; products: number }[] }>();
+  for (const r of rows) {
+    const c = by.get(r.category) ?? { name: r.category as string, products: 0, sub_categories: [] }; by.set(r.category, c);
+    c.products += Number(r.n); if (r.sub_category) c.sub_categories.push({ name: r.sub_category, products: Number(r.n) });
+  }
+  const categories = [...by.values()].sort((a, b) => b.products - a.products).map((c) => ({ ...c, sub_categories: c.sub_categories.sort((a, b) => b.products - a.products) }));
+  const rails = [];
+  for (const c of categories.slice(0, 6)) {
+    const ps = await q<any>(pool, 'SELECT * FROM store_products WHERE retailer_id IN (?) AND deleted_at IS NULL AND is_active = 1 AND category = ? ORDER BY (stock_qty > 0) DESC, (mrp_paise > price_paise) DESC, id DESC LIMIT 10', [ids, c.name]);
+    rails.push({ category: c.name, products: ps.map(withStore(names)) });
+  }
+  res.json({ categories, rails });
+}));
+
+const SORTS: Record<string, string> = { relevance: '(stock_qty > 0) DESC, id DESC', price_asc: 'price_paise ASC', price_desc: 'price_paise DESC', discount: '(CASE WHEN mrp_paise > price_paise THEN (mrp_paise - price_paise) / mrp_paise ELSE 0 END) DESC', newest: 'id DESC' };
+
+/** Products of a category (and sub-category) with filters: brand, price range, in stock, sort. Also the facets to build the filter bar from. */
+customerRouter.get('/products', asyncHandler(async (req, res) => {
+  const qs = coords.extend({
+    category: z.string().trim().max(80).optional(), sub_category: z.string().trim().max(80).optional(), q: z.string().trim().max(100).optional(),
+    brand: z.string().trim().max(80).optional(), min_price: z.coerce.number().min(0).optional(), max_price: z.coerce.number().min(0).optional(),
+    in_stock: z.enum(['1', '0']).optional(), sort: z.enum(['relevance', 'price_asc', 'price_desc', 'discount', 'newest']).default('relevance'),
+    limit: z.coerce.number().int().min(1).max(60).default(30), offset: z.coerce.number().int().min(0).default(0),
+  }).parse(req.query);
+  const { ids, names } = await liveIds(req, qs);
+  if (!ids.length) return res.json({ products: [], total: 0, facets: { sub_categories: [], brands: [], price: { min: 0, max: 0 } } });
+  const base = ['retailer_id IN (?)', 'deleted_at IS NULL', 'is_active = 1']; const bargs: unknown[] = [ids];
+  if (qs.category) { base.push('category = ?'); bargs.push(qs.category); }
+  if (qs.q) { base.push('(name LIKE ? OR brand LIKE ?)'); bargs.push(`%${qs.q}%`, `%${qs.q}%`); }
+  const where = [...base]; const args = [...bargs];
+  if (qs.sub_category) { where.push('sub_category = ?'); args.push(qs.sub_category); }
+  if (qs.brand) { where.push('brand = ?'); args.push(qs.brand); }
+  if (qs.min_price != null) { where.push('price_paise >= ?'); args.push(toPaise(qs.min_price)); }
+  if (qs.max_price != null) { where.push('price_paise <= ?'); args.push(toPaise(qs.max_price)); }
+  if (qs.in_stock === '1') where.push('stock_qty > 0');
+  const rows = await q<any>(pool, `SELECT * FROM store_products WHERE ${where.join(' AND ')} ORDER BY ${SORTS[qs.sort]}, id LIMIT ? OFFSET ?`, [...args, qs.limit, qs.offset]);
+  const total = Number((await q1<any>(pool, `SELECT COUNT(*) n FROM store_products WHERE ${where.join(' AND ')}`, args))!.n);
+  const subs = await q<any>(pool, `SELECT sub_category name, COUNT(*) n FROM store_products WHERE ${base.join(' AND ')} AND sub_category IS NOT NULL GROUP BY sub_category ORDER BY n DESC`, bargs);
+  const brands = await q<any>(pool, `SELECT brand name, COUNT(*) n FROM store_products WHERE ${base.join(' AND ')} AND brand IS NOT NULL ${qs.sub_category ? 'AND sub_category = ?' : ''} GROUP BY brand ORDER BY n DESC LIMIT 20`, qs.sub_category ? [...bargs, qs.sub_category] : bargs);
+  const pr = (await q1<any>(pool, `SELECT MIN(price_paise) lo, MAX(price_paise) hi FROM store_products WHERE ${base.join(' AND ')}`, bargs))!;
+  res.json({ products: rows.map(withStore(names)), total,
+    facets: { sub_categories: subs.map((r) => ({ name: r.name, products: Number(r.n) })), brands: brands.map((r) => ({ name: r.name, products: Number(r.n) })), price: { min: money(pr.lo ?? 0), max: money(pr.hi ?? 0) } } });
+}));
+
 async function storeView(id: number, w: Where) {
   const s = await q1<any>(pool, 'SELECT * FROM retailer_stores WHERE retailer_id = ?', [id]);
   if (!s || !(await storeLive(pool, s))) throw notFound('Store');

@@ -113,7 +113,7 @@ async function syncCover(productId: number) {
   else await exec(pool, "UPDATE store_products SET image_url = NULL WHERE id = ? AND image_url LIKE '/api/v1/media/%'", [productId]);
 }
 const productBody = z.object({
-  name: z.string().trim().min(1).max(190), description: optText(1000), brand: optText(80), category: optText(80), unit: z.string().trim().min(1).max(20).default('pcs'),
+  name: z.string().trim().min(1).max(190), description: optText(1000), brand: optText(80), category: optText(80), sub_category: optText(80), unit: z.string().trim().min(1).max(20).default('pcs'),
   barcode: z.string().trim().regex(/^[A-Za-z0-9-]{4,40}$/, 'Barcode is 4 to 40 letters, digits or dashes').nullable().optional(), sku: optText(60),
   price: z.union([z.string(), z.number()]), mrp: z.union([z.string(), z.number()]).nullable().optional(), cost: z.union([z.string(), z.number()]).nullable().optional(),
   gst_rate_bps: z.number().int().min(0).max(2800).default(0), stock_qty: z.number().int().min(0).max(10_000_000).default(0), image_url: optText(255), is_active: z.boolean().default(true),
@@ -144,8 +144,8 @@ storeRouter.post('/products', asyncHandler(async (req, res) => {
   if (price <= 0) throw new AppError(400, 'BAD_PRICE', 'Price must be more than zero');
   if (mrp != null && mrp < price) throw new AppError(400, 'BAD_MRP', 'The M.R.P. cannot be less than the selling price');
   if (b.barcode && (await q1(pool, 'SELECT 1 FROM store_products WHERE retailer_id = ? AND barcode = ? AND deleted_at IS NULL', [s.retailer_id, b.barcode]))) throw new AppError(409, 'BARCODE_TAKEN', 'Another product of yours already uses this barcode');
-  const r = await exec(pool, `INSERT INTO store_products (retailer_id, name, description, brand, category, unit, barcode, sku, price_paise, mrp_paise, cost_paise, gst_rate_bps, stock_qty, image_url, is_active)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [s.retailer_id, b.name, b.description ?? null, b.brand ?? null, b.category ?? null, b.unit, b.barcode ?? null, b.sku ?? null, price, mrp, cost, b.gst_rate_bps, b.stock_qty, b.image_url ?? null, b.is_active ? 1 : 0]);
+  const r = await exec(pool, `INSERT INTO store_products (retailer_id, name, description, brand, category, sub_category, unit, barcode, sku, price_paise, mrp_paise, cost_paise, gst_rate_bps, stock_qty, image_url, is_active)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [s.retailer_id, b.name, b.description ?? null, b.brand ?? null, b.category ?? null, b.sub_category ?? null, b.unit, b.barcode ?? null, b.sku ?? null, price, mrp, cost, b.gst_rate_bps, b.stock_qty, b.image_url ?? null, b.is_active ? 1 : 0]);
   res.status(201).json((await withPhotos([(await q1<any>(pool, 'SELECT * FROM store_products WHERE id = ?', [r.insertId]))!]))[0]);
 }));
 
@@ -162,8 +162,8 @@ storeRouter.put('/products/:id', asyncHandler(async (req, res) => {
   const barcode = b.barcode === undefined ? cur.barcode : b.barcode;
   if (barcode && barcode !== cur.barcode && (await q1(pool, 'SELECT 1 FROM store_products WHERE retailer_id = ? AND barcode = ? AND deleted_at IS NULL AND id <> ?', [s.retailer_id, barcode, id]))) throw new AppError(409, 'BARCODE_TAKEN', 'Another product of yours already uses this barcode');
   const pick = (k: keyof typeof b, old: unknown) => (b[k] === undefined ? old : b[k]);
-  await exec(pool, `UPDATE store_products SET name=?, description=?, brand=?, category=?, unit=?, barcode=?, sku=?, price_paise=?, mrp_paise=?, cost_paise=?, gst_rate_bps=?, stock_qty=?, image_url=?, is_active=? WHERE id = ?`, [
-    pick('name', cur.name), pick('description', cur.description), pick('brand', cur.brand), pick('category', cur.category), pick('unit', cur.unit), barcode, pick('sku', cur.sku), price, mrp, cost,
+  await exec(pool, `UPDATE store_products SET name=?, description=?, brand=?, category=?, sub_category=?, unit=?, barcode=?, sku=?, price_paise=?, mrp_paise=?, cost_paise=?, gst_rate_bps=?, stock_qty=?, image_url=?, is_active=? WHERE id = ?`, [
+    pick('name', cur.name), pick('description', cur.description), pick('brand', cur.brand), pick('category', cur.category), pick('sub_category', cur.sub_category), pick('unit', cur.unit), barcode, pick('sku', cur.sku), price, mrp, cost,
     pick('gst_rate_bps', cur.gst_rate_bps), pick('stock_qty', cur.stock_qty), pick('image_url', cur.image_url), b.is_active === undefined ? cur.is_active : b.is_active ? 1 : 0, id]);
   const fresh = (await q1<any>(pool, 'SELECT * FROM store_products WHERE id = ?', [id]))!;
   res.json((await withPhotos([fresh]))[0]);
@@ -239,8 +239,10 @@ storeRouter.post('/products/import', asyncHandler(async (req, res) => {
     const cost = withGst(toPaise(p.price), p.gst_rate_bps);
     const price = Math.max(cost, Math.round(cost * (1 + b.markup_percent / 100)));
     const mrp = p.mrp ? Math.max(price, toPaise(p.mrp)) : null;
-    await exec(pool, `INSERT INTO store_products (retailer_id, name, brand, category, unit, barcode, price_paise, mrp_paise, cost_paise, gst_rate_bps, stock_qty, image_url, source_distributor_id, source_product_id)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [s.retailer_id, p.display_name ?? p.name, p.brand ?? null, p.category ?? null, p.unit ?? 'pcs', p.barcode ?? null, price, mrp, cost, p.gst_rate_bps, b.stock_qty, p.image_url ?? null, b.distributor_id, id]);
+    // a product in a sub-category is shown under its main category, with the sub-category kept for browsing
+    const tree = p.category ? await q1<any>(pool, "SELECT c.name, pc.name parent_name FROM categories c JOIN categories pc ON pc.id = c.parent_id WHERE c.name_key = LOWER(?) AND c.status <> 'retired' LIMIT 1", [p.category]) : null;
+    await exec(pool, `INSERT INTO store_products (retailer_id, name, brand, category, sub_category, unit, barcode, price_paise, mrp_paise, cost_paise, gst_rate_bps, stock_qty, image_url, source_distributor_id, source_product_id)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [s.retailer_id, p.display_name ?? p.name, p.brand ?? null, tree ? tree.parent_name : p.category ?? null, tree ? tree.name : null, p.unit ?? 'pcs', p.barcode ?? null, price, mrp, cost, p.gst_rate_bps, b.stock_qty, p.image_url ?? null, b.distributor_id, id]);
     added++;
   }
   res.status(201).json({ added, skipped });

@@ -75,7 +75,7 @@ export function presentStore(s: any, opts: { distance?: number | null; live?: bo
 }
 
 export const presentProduct = (p: any) => ({
-  id: p.id, name: p.name, description: p.description, brand: p.brand, category: p.category, unit: p.unit, barcode: p.barcode, sku: p.sku,
+  id: p.id, name: p.name, description: p.description, brand: p.brand, category: p.category, sub_category: p.sub_category ?? null, unit: p.unit, barcode: p.barcode, sku: p.sku,
   price: money(p.price_paise), mrp: p.mrp_paise == null ? null : money(p.mrp_paise), gst_rate_bps: p.gst_rate_bps,
   discount_pct: p.mrp_paise && Number(p.mrp_paise) > Number(p.price_paise) ? Math.round(((Number(p.mrp_paise) - Number(p.price_paise)) / Number(p.mrp_paise)) * 100) : 0,
   stock_qty: Number(p.stock_qty), in_stock: Number(p.stock_qty) > 0, image_url: p.image_url, is_active: !!p.is_active, imported: !!p.source_product_id,

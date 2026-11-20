@@ -374,3 +374,25 @@ describe('deleting an account', () => {
     expect((await request(app).get('/api/v1/customer/home').set(auth(c.token))).body.pinned_store).toBeNull();
   });
 });
+
+describe('browsing by category', () => {
+  it('lists categories with sub-categories, and filters products by sub-category, brand, price and stock', async () => {
+    const a = await admin(); const d = await distributor(); const r = await liveRetailer(a, d);
+    await addProduct(r, { name: 'Lap One', price: '500', mrp: '600', stock_qty: 5, category: 'Electronics', sub_category: 'Laptops', brand: 'Acme' }).expect(201);
+    await addProduct(r, { name: 'Phone One', price: '200', mrp: '250', stock_qty: 0, category: 'Electronics', sub_category: 'Mobiles', brand: 'Zed' }).expect(201);
+    const c = await customer({ store_code: (await store(r)).store_code });
+    const cat = (await request(app).get('/api/v1/customer/catalog').set(auth(c.token)).expect(200)).body;
+    const e = cat.categories.find((x: any) => x.name === 'Electronics');
+    expect(e.sub_categories.map((x: any) => x.name).sort()).toEqual(['Laptops', 'Mobiles']);
+    expect(cat.rails.find((x: any) => x.category === 'Electronics').products.length).toBe(2);
+    const sub = (await request(app).get('/api/v1/customer/products').query({ category: 'Electronics', sub_category: 'Laptops' }).set(auth(c.token)).expect(200)).body;
+    expect(sub.products.map((x: any) => x.name)).toEqual(['Lap One']);
+    expect(sub.facets.sub_categories.length).toBe(2);
+    const stock = (await request(app).get('/api/v1/customer/products').query({ category: 'Electronics', in_stock: '1' }).set(auth(c.token))).body;
+    expect(stock.products.map((x: any) => x.name)).toEqual(['Lap One']);
+    const cheap = (await request(app).get('/api/v1/customer/products').query({ category: 'Electronics', max_price: 300, sort: 'price_asc' }).set(auth(c.token))).body;
+    expect(cheap.products.map((x: any) => x.name)).toEqual(['Phone One']);
+    const brand = (await request(app).get('/api/v1/customer/products').query({ category: 'Electronics', brand: 'Acme' }).set(auth(c.token))).body;
+    expect(brand.total).toBe(1);
+  });
+});
