@@ -42,7 +42,7 @@ storeRouter.get('/me', asyncHandler(async (req, res) => {
   const s = await myStore(req);
   const live = await storeLive(pool, s);
   res.json({
-    store: { ...presentStore(s, { live }), upi_id: s.upi_id, upi_payee: s.upi_payee, open_override: s.open_override, is_active: !!s.is_active },
+    store: { ...presentStore(s, { live }), upi_id: s.upi_id, upi_payee: s.upi_payee, open_override: s.open_override, is_active: !!s.is_active, notice_text: s.notice_text ?? null, notice_expires_at: s.notice_expires_at ? new Date(s.notice_expires_at).toISOString() : null },
     live, qr_text: storeQrText(s.code), store_code: s.code,
   });
 }));
@@ -57,6 +57,7 @@ storeRouter.put('/me', asyncHandler(async (req, res) => {
     min_order: z.union([z.string(), z.number()]).optional(), delivery_minutes_min: z.number().int().min(0).max(1440).nullable().optional(), delivery_minutes_max: z.number().int().min(0).max(1440).nullable().optional(),
     upi_id: z.string().trim().regex(/^[a-zA-Z0-9.\-_]{2,64}@[a-zA-Z]{2,32}$/, 'UPI id looks like name@bank').nullable().optional(), upi_payee: optText(80),
     accepts_cod: z.boolean().optional(), accepts_upi: z.boolean().optional(), is_active: z.boolean().optional(),
+    notice: optText(300), notice_days: z.number().int().min(1).max(60).nullable().optional(),
   }).parse(req.body);
   const s = await myStore(req);
   const sets: string[] = []; const args: unknown[] = [];
@@ -67,6 +68,8 @@ storeRouter.put('/me', asyncHandler(async (req, res) => {
   if (b.accepts_cod !== undefined) put('accepts_cod', b.accepts_cod ? 1 : 0);
   if (b.accepts_upi !== undefined) put('accepts_upi', b.accepts_upi ? 1 : 0);
   if (b.is_active !== undefined) put('is_active', b.is_active ? 1 : 0);
+  // the scrolling notice: its text, and for how many days it stays (no days = until the retailer removes it)
+  if (b.notice !== undefined) { put('notice_text', b.notice); put('notice_expires_at', b.notice && b.notice_days ? new Date(Date.now() + b.notice_days * 86_400_000) : null); }
   if (b.delivery_fee !== undefined) put('delivery_fee_paise', toPaise(b.delivery_fee));
   if (b.free_delivery_above !== undefined) put('free_delivery_above_paise', b.free_delivery_above == null ? null : toPaise(b.free_delivery_above));
   if (b.min_order !== undefined) put('min_order_paise', toPaise(b.min_order));

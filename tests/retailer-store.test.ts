@@ -396,3 +396,21 @@ describe('browsing by category', () => {
     expect(brand.total).toBe(1);
   });
 });
+
+describe('the store notice', () => {
+  it('shows a scrolling notice to customers only while the retailer has one set', async () => {
+    const a = await admin(); const d = await distributor(); const r = await liveRetailer(a, d);
+    const c = await customer({ store_code: (await store(r)).store_code });
+    const home = async () => (await request(app).get('/api/v1/customer/home').set(auth(c.token)).expect(200)).body.pinned_store;
+    expect((await home()).notice).toBeNull();
+    await request(app).put('/api/v1/store/me').set(auth(r.token)).send({ notice: 'Free delivery this Sunday', notice_days: 3 }).expect(200);
+    expect((await home()).notice).toBe('Free delivery this Sunday');
+    expect((await request(app).get('/api/v1/store/me').set(auth(r.token))).body.store.notice_text).toBe('Free delivery this Sunday');
+    await pool.query("UPDATE retailer_stores SET notice_expires_at = DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 HOUR) WHERE retailer_id = ?", [r.id]);
+    expect((await home()).notice).toBeNull();
+    await request(app).put('/api/v1/store/me').set(auth(r.token)).send({ notice: 'Open late today' }).expect(200);
+    expect((await home()).notice).toBe('Open late today');
+    await request(app).put('/api/v1/store/me').set(auth(r.token)).send({ notice: null }).expect(200);
+    expect((await home()).notice).toBeNull();
+  });
+});

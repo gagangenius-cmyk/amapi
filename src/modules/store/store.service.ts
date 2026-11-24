@@ -70,6 +70,7 @@ export function presentStore(s: any, opts: { distance?: number | null; live?: bo
     delivery_enabled: !!s.delivery_enabled, delivery_fee: money(s.delivery_fee_paise), free_delivery_above: s.free_delivery_above_paise == null ? null : money(s.free_delivery_above_paise),
     min_order: money(s.min_order_paise), delivery_minutes: s.delivery_minutes_min ? { min: s.delivery_minutes_min, max: s.delivery_minutes_max ?? s.delivery_minutes_min } : null,
     accepts_cod: !!s.accepts_cod, accepts_upi: !!s.accepts_upi && !!s.upi_id,
+    notice: s.notice_text && (!s.notice_expires_at || new Date(s.notice_expires_at).getTime() > Date.now()) ? s.notice_text : null,
     ...(opts.distance !== undefined ? { distance_km: opts.distance } : {}), ...(opts.live !== undefined ? { live: opts.live } : {}),
   };
 }
