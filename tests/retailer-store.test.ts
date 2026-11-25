@@ -414,3 +414,43 @@ describe('the store notice', () => {
     expect((await home()).notice).toBeNull();
   });
 });
+
+describe('customer occasions', () => {
+  it('works out the next date, keeping 29 February on 28 February in other years', async () => {
+    const { nextOccurrence } = await import('../src/modules/store/occasions');
+    expect(nextOccurrence(11, 26, { y: 2026, m: 11, d: 26 })).toEqual({ year: 2026, days_until: 0 });
+    expect(nextOccurrence(11, 25, { y: 2026, m: 11, d: 26 })).toEqual({ year: 2027, days_until: 364 });
+    expect(nextOccurrence(12, 1, { y: 2026, m: 11, d: 26 })).toEqual({ year: 2026, days_until: 5 });
+    expect(nextOccurrence(2, 29, { y: 2027, m: 2, d: 20 })).toEqual({ year: 2027, days_until: 8 });
+  });
+
+  it('saves family dates for a customer, lists the coming ones with a wish, and sends the wish', async () => {
+    const a = await admin(); const d = await distributor(); const r = await liveRetailer(a, d);
+    const c = await customer({ store_code: (await store(r)).store_code });
+    const mine = (await request(app).get('/api/v1/store/customers').set(auth(r.token))).body.customers[0];
+    const ist = new Date(Date.now() + 5.5 * 3600_000);
+    const soon = new Date(ist.getTime() + 2 * 86_400_000);
+    const far = new Date(ist.getTime() + 40 * 86_400_000);
+    const add = (over: object) => request(app).post(`/api/v1/store/customers/${mine.id}/occasions`).set(auth(r.token)).send({ person_name: 'Riya', relation: 'daughter', kind: 'birthday', month: soon.getUTCMonth() + 1, day: soon.getUTCDate(), birth_year: 2020, ...over });
+    await add({}).expect(201);
+    await add({ person_name: 'Aman', relation: 'son', month: far.getUTCMonth() + 1, day: far.getUTCDate() }).expect(201);
+    expect((await add({ month: 2, day: 31 })).status).toBe(400);
+    expect((await request(app).get(`/api/v1/store/customers/${mine.id}/occasions`).set(auth(r.token))).body.occasions.length).toBe(2);
+
+    const up = (await request(app).get('/api/v1/store/occasions/upcoming').set(auth(r.token)).expect(200)).body;
+    expect(up.occasions.map((x: any) => x.person_name)).toEqual(['Riya']);
+    expect(up.occasions[0].days_until).toBe(2);
+    expect(up.occasions[0].wish).toContain('Riya');
+    expect(up.pending).toBe(1);
+
+    await request(app).post(`/api/v1/store/occasions/${up.occasions[0].id}/wish`).set(auth(r.token)).send({ message: 'Happy birthday Riya! 10% off on cakes.' }).expect(200);
+    expect((await request(app).get('/api/v1/store/occasions/upcoming').set(auth(r.token))).body.pending).toBe(0);
+
+    // another retailer cannot see or touch them
+    const other = await liveRetailer(a, d);
+    expect((await request(app).get('/api/v1/store/occasions/upcoming').set(auth(other.token))).body.occasions).toEqual([]);
+    await request(app).delete(`/api/v1/store/occasions/${up.occasions[0].id}`).set(auth(other.token)).expect(404);
+    await request(app).delete(`/api/v1/store/occasions/${up.occasions[0].id}`).set(auth(r.token)).expect(204);
+    void c;
+  });
+});

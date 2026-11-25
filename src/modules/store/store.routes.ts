@@ -12,6 +12,7 @@ import { toPaise, withGst } from '../../utils/money';
 import { storefrontProducts } from '../catalog/catalog.routes';
 import { storeAccess } from '../retailers/access';
 import { addStoreCustomer, ensureStore, money, presentOrder, presentProduct, presentStore, storeLive, storeQrText, todayIst } from './store.service';
+import { occasionsRouter } from './occasions';
 import { upiUri } from '../subscription/subscription.service';
 
 /*
@@ -21,6 +22,7 @@ import { upiUri } from '../subscription/subscription.service';
  */
 export const storeRouter = Router();
 storeRouter.use(authenticate, requireRole('retailer'));
+storeRouter.use(occasionsRouter);
 
 async function myStore(req: any) {
   const s = await ensureStore(pool, req.auth.userId);
