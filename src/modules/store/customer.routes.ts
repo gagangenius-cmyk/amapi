@@ -185,6 +185,20 @@ customerRouter.get('/products', asyncHandler(async (req, res) => {
     facets: { sub_categories: subs.map((r) => ({ name: r.name, products: Number(r.n) })), brands: brands.map((r) => ({ name: r.name, products: Number(r.n) })), price: { min: money(pr.lo ?? 0), max: money(pr.hi ?? 0) } } });
 }));
 
+// The bell: offers from the customer's own stores (the one pinned, and every store whose list they are on).
+customerRouter.get('/notifications', asyncHandler(async (req, res) => {
+  const m = await mine(req.auth!.userId);
+  const ids = (await q<any>(pool, 'SELECT retailer_id FROM store_customers WHERE customer_id = ?', [m.id])).map((x) => Number(x.retailer_id));
+  if (m.pinned_retailer_id) ids.push(Number(m.pinned_retailer_id));
+  if (!ids.length) return res.json({ items: [] });
+  const rows = await q<any>(pool, `SELECT s.*, s.name store_name, o.id offer_id, o.title offer_title, o.description offer_text, o.created_at offered_at
+    FROM store_offers o JOIN retailer_stores s ON s.retailer_id = o.retailer_id
+    WHERE o.retailer_id IN (?) AND o.is_active = 1 AND (o.starts_on IS NULL OR o.starts_on <= CURDATE()) AND (o.ends_on IS NULL OR o.ends_on >= CURDATE()) ORDER BY o.id DESC LIMIT 50`, [ids]);
+  const items = [];
+  for (const r of rows) if (await storeLive(pool, r)) items.push({ id: r.offer_id, retailer_id: r.retailer_id, store_name: r.store_name, title: r.offer_title, description: r.offer_text, created_at: r.offered_at });
+  res.json({ items });
+}));
+
 async function storeView(id: number, w: Where) {
   const s = await q1<any>(pool, 'SELECT * FROM retailer_stores WHERE retailer_id = ?', [id]);
   if (!s || !(await storeLive(pool, s))) throw notFound('Store');

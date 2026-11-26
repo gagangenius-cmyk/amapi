@@ -265,6 +265,12 @@ storeRouter.get('/customers', asyncHandler(async (req, res) => {
     FROM store_customers sc WHERE ${where.join(' AND ')} ORDER BY sc.id DESC LIMIT 300`, args);
   res.json({ customers: rows.map((c) => ({ id: c.id, name: c.name, phone: c.phone, source: c.source, has_app: !!c.customer_id, orders: Number(c.orders), spent: money(c.spent), joined: c.created_at })) });
 }));
+storeRouter.put('/customers/:id', asyncHandler(async (req, res) => {
+  const b = z.object({ name: z.string().trim().min(2).max(120) }).parse(req.body);
+  const r = await exec(pool, 'UPDATE store_customers SET name = ? WHERE id = ? AND retailer_id = ?', [b.name, idParam(req), req.auth!.userId]);
+  if (!r.affectedRows) throw notFound('Customer');
+  res.json({ ok: true });
+}));
 storeRouter.post('/customers', asyncHandler(async (req, res) => {
   const b = z.object({ name: z.string().trim().min(2).max(120), phone: z.string().regex(/^\d{10}$/, '10-digit phone') }).parse(req.body);
   const s = await myStore(req);
@@ -445,6 +451,11 @@ storeRouter.get('/offers', asyncHandler(async (req, res) => { res.json({ offers:
 storeRouter.post('/offers', asyncHandler(async (req, res) => {
   const b = offerBody.parse(req.body); const s = await myStore(req);
   const r = await exec(pool, 'INSERT INTO store_offers (retailer_id, title, description, starts_on, ends_on, is_active) VALUES (?,?,?,?,?,?)', [s.retailer_id, b.title, b.description ?? null, b.starts_on ?? null, b.ends_on ?? null, b.is_active ? 1 : 0]);
+  // an offer that is live now reaches the phones of the store's customers who use the app
+  if (b.is_active && (!b.starts_on || b.starts_on <= todayIst())) {
+    const to = (await q<any>(pool, 'SELECT customer_id FROM store_customers WHERE retailer_id = ? AND customer_id IS NOT NULL', [s.retailer_id])).map((x) => Number(x.customer_id));
+    for (let i = 0; i < to.length; i += 100) void notifyUsers(to.slice(i, i + 100), `${s.name}: ${b.title}`, b.description ?? 'New offer', { type: 'store_offer', id: s.retailer_id });
+  }
   res.status(201).json(await q1(pool, 'SELECT id, title, description, starts_on, ends_on, is_active FROM store_offers WHERE id = ?', [r.insertId]));
 }));
 storeRouter.put('/offers/:id', asyncHandler(async (req, res) => {

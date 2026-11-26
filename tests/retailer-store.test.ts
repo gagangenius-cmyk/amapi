@@ -417,7 +417,7 @@ describe('the store notice', () => {
 
 describe('customer occasions', () => {
   it('works out the next date, keeping 29 February on 28 February in other years', async () => {
-    const { nextOccurrence } = await import('../src/modules/store/occasions');
+    const { nextOccurrence } = await import('../src/modules/store/occasions.js');
     expect(nextOccurrence(11, 26, { y: 2026, m: 11, d: 26 })).toEqual({ year: 2026, days_until: 0 });
     expect(nextOccurrence(11, 25, { y: 2026, m: 11, d: 26 })).toEqual({ year: 2027, days_until: 364 });
     expect(nextOccurrence(12, 1, { y: 2026, m: 11, d: 26 })).toEqual({ year: 2026, days_until: 5 });
@@ -452,5 +452,22 @@ describe('customer occasions', () => {
     await request(app).delete(`/api/v1/store/occasions/${up.occasions[0].id}`).set(auth(other.token)).expect(404);
     await request(app).delete(`/api/v1/store/occasions/${up.occasions[0].id}`).set(auth(r.token)).expect(204);
     void c;
+  });
+});
+
+describe('the customer bell', () => {
+  it('lists the live offers of the customer’s stores, and lets the retailer rename a customer', async () => {
+    const a = await admin(); const d = await distributor(); const r = await liveRetailer(a, d);
+    const c = await customer({ store_code: (await store(r)).store_code });
+    const bell = async () => (await request(app).get('/api/v1/customer/notifications').set(auth(c.token)).expect(200)).body.items;
+    expect(await bell()).toEqual([]);
+    await request(app).post('/api/v1/store/offers').set(auth(r.token)).send({ title: 'Cake week', description: '10% off' }).expect(201);
+    await request(app).post('/api/v1/store/offers').set(auth(r.token)).send({ title: 'Later offer', starts_on: '2099-01-01' }).expect(201);
+    const items = await bell();
+    expect(items.map((x: any) => x.title)).toEqual(['Cake week']);
+    expect(items[0]).toMatchObject({ retailer_id: r.id, description: '10% off' });
+    const mine = (await request(app).get('/api/v1/store/customers').set(auth(r.token))).body.customers[0];
+    await request(app).put(`/api/v1/store/customers/${mine.id}`).set(auth(r.token)).send({ name: 'Riya Mom' }).expect(200);
+    expect((await request(app).get('/api/v1/store/customers').set(auth(r.token))).body.customers[0].name).toBe('Riya Mom');
   });
 });
