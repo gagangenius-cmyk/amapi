@@ -446,8 +446,9 @@ storeRouter.get('/reports/sales', asyncHandler(async (req, res) => {
     by_channel: byChannel.map((c) => ({ channel: c.channel, orders: Number(c.n), total: money(c.total) })) });
 }));
 
+const OFFER_COLS = "SELECT id, title, description, starts_on, ends_on, is_active, IF(image_key IS NULL, NULL, CONCAT('/api/v1/media/', image_key)) image_url FROM store_offers";
 const offerBody = z.object({ title: z.string().trim().min(2).max(120), description: optText(300), starts_on: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(), ends_on: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(), is_active: z.boolean().default(true) });
-storeRouter.get('/offers', asyncHandler(async (req, res) => { res.json({ offers: await q<any>(pool, 'SELECT id, title, description, starts_on, ends_on, is_active FROM store_offers WHERE retailer_id = ? ORDER BY id DESC', [req.auth!.userId]) }); }));
+storeRouter.get('/offers', asyncHandler(async (req, res) => { res.json({ offers: await q<any>(pool, `${OFFER_COLS} WHERE retailer_id = ? ORDER BY id DESC`, [req.auth!.userId]) }); }));
 storeRouter.post('/offers', asyncHandler(async (req, res) => {
   const b = offerBody.parse(req.body); const s = await myStore(req);
   const r = await exec(pool, 'INSERT INTO store_offers (retailer_id, title, description, starts_on, ends_on, is_active) VALUES (?,?,?,?,?,?)', [s.retailer_id, b.title, b.description ?? null, b.starts_on ?? null, b.ends_on ?? null, b.is_active ? 1 : 0]);
@@ -456,14 +457,26 @@ storeRouter.post('/offers', asyncHandler(async (req, res) => {
     const to = (await q<any>(pool, 'SELECT customer_id FROM store_customers WHERE retailer_id = ? AND customer_id IS NOT NULL', [s.retailer_id])).map((x) => Number(x.customer_id));
     for (let i = 0; i < to.length; i += 100) void notifyUsers(to.slice(i, i + 100), `${s.name}: ${b.title}`, b.description ?? 'New offer', { type: 'store_offer', id: s.retailer_id });
   }
-  res.status(201).json(await q1(pool, 'SELECT id, title, description, starts_on, ends_on, is_active FROM store_offers WHERE id = ?', [r.insertId]));
+  res.status(201).json(await q1(pool, `${OFFER_COLS} WHERE id = ?`, [r.insertId]));
 }));
 storeRouter.put('/offers/:id', asyncHandler(async (req, res) => {
   const b = offerBody.partial().parse(req.body); const id = idParam(req);
   const cur = await q1<any>(pool, 'SELECT * FROM store_offers WHERE id = ? AND retailer_id = ?', [id, req.auth!.userId]);
   if (!cur) throw notFound('Offer');
   await exec(pool, 'UPDATE store_offers SET title=?, description=?, starts_on=?, ends_on=?, is_active=? WHERE id = ?', [b.title ?? cur.title, b.description === undefined ? cur.description : b.description, b.starts_on === undefined ? cur.starts_on : b.starts_on, b.ends_on === undefined ? cur.ends_on : b.ends_on, b.is_active === undefined ? cur.is_active : b.is_active ? 1 : 0, id]);
-  res.json(await q1(pool, 'SELECT id, title, description, starts_on, ends_on, is_active FROM store_offers WHERE id = ?', [id]));
+  res.json(await q1(pool, `${OFFER_COLS} WHERE id = ?`, [id]));
+}));
+// The banner picture of an offer: the raw image bytes are the request body (a wide picture, 2:1, looks best).
+storeRouter.post('/offers/:id/image', rawImage, asyncHandler(async (req, res) => {
+  const id = idParam(req);
+  if (!Buffer.isBuffer(req.body) || !req.body.length) throw new AppError(415, 'BAD_IMAGE', 'Send a JPEG, PNG or WebP image as the request body (max 4 MB)');
+  const mime = sniffImage(req.body);
+  if (!mime) throw new AppError(415, 'BAD_IMAGE', 'That file is not a valid JPEG, PNG or WebP image');
+  if (!(await q1(pool, 'SELECT 1 FROM store_offers WHERE id = ? AND retailer_id = ?', [id, req.auth!.userId]))) throw notFound('Offer');
+  const key = crypto.randomBytes(20).toString('hex');
+  await storage.put(`${key}.${EXT[mime]}`, req.body, mime);
+  await exec(pool, 'UPDATE store_offers SET image_key = ?, image_mime = ? WHERE id = ?', [key, mime, id]);
+  res.status(201).json(await q1(pool, `${OFFER_COLS} WHERE id = ?`, [id]));
 }));
 storeRouter.delete('/offers/:id', asyncHandler(async (req, res) => {
   const r = await exec(pool, 'DELETE FROM store_offers WHERE id = ? AND retailer_id = ?', [idParam(req), req.auth!.userId]);

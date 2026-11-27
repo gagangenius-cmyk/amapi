@@ -105,7 +105,7 @@ customerRouter.get('/home', asyncHandler(async (req, res) => {
   }
   const ids = [...new Set([...(pinned ? [pinned.id] : []), ...near.map((x) => x.s.retailer_id)])];
   const cats = ids.length ? await q<any>(pool, `SELECT category, COUNT(*) n FROM store_products WHERE retailer_id IN (?) AND deleted_at IS NULL AND is_active = 1 AND category IS NOT NULL GROUP BY category ORDER BY n DESC LIMIT 12`, [ids]) : [];
-  const offers = ids.length ? await q<any>(pool, `SELECT o.id, o.retailer_id, o.title, o.description, s.name store_name FROM store_offers o JOIN retailer_stores s ON s.retailer_id = o.retailer_id
+  const offers = ids.length ? await q<any>(pool, `SELECT o.id, o.retailer_id, o.title, o.description, s.name store_name, IF(o.image_key IS NULL, NULL, CONCAT('/api/v1/media/', o.image_key)) image_url FROM store_offers o JOIN retailer_stores s ON s.retailer_id = o.retailer_id
     WHERE o.retailer_id IN (?) AND o.is_active = 1 AND (o.starts_on IS NULL OR o.starts_on <= CURDATE()) AND (o.ends_on IS NULL OR o.ends_on >= CURDATE()) ORDER BY (o.retailer_id = ?) DESC, o.id DESC LIMIT 10`, [ids, pinned?.id ?? 0]) : [];
   res.json({ pinned_store: pinned, nearby_stores: near.filter((x) => x.s.retailer_id !== pinned?.id).map(storeCard), categories: cats.map((c) => ({ name: c.category, products: Number(c.n) })), banners: offers });
 }));
@@ -191,11 +191,11 @@ customerRouter.get('/notifications', asyncHandler(async (req, res) => {
   const ids = (await q<any>(pool, 'SELECT retailer_id FROM store_customers WHERE customer_id = ?', [m.id])).map((x) => Number(x.retailer_id));
   if (m.pinned_retailer_id) ids.push(Number(m.pinned_retailer_id));
   if (!ids.length) return res.json({ items: [] });
-  const rows = await q<any>(pool, `SELECT s.*, s.name store_name, o.id offer_id, o.title offer_title, o.description offer_text, o.created_at offered_at
+  const rows = await q<any>(pool, `SELECT s.*, s.name store_name, o.id offer_id, o.title offer_title, o.image_key offer_image, o.description offer_text, o.created_at offered_at
     FROM store_offers o JOIN retailer_stores s ON s.retailer_id = o.retailer_id
     WHERE o.retailer_id IN (?) AND o.is_active = 1 AND (o.starts_on IS NULL OR o.starts_on <= CURDATE()) AND (o.ends_on IS NULL OR o.ends_on >= CURDATE()) ORDER BY o.id DESC LIMIT 50`, [ids]);
   const items = [];
-  for (const r of rows) if (await storeLive(pool, r)) items.push({ id: r.offer_id, retailer_id: r.retailer_id, store_name: r.store_name, title: r.offer_title, description: r.offer_text, created_at: r.offered_at });
+  for (const r of rows) if (await storeLive(pool, r)) items.push({ id: r.offer_id, retailer_id: r.retailer_id, store_name: r.store_name, title: r.offer_title, description: r.offer_text, image_url: r.offer_image ? `/api/v1/media/${r.offer_image}` : null, created_at: r.offered_at });
   res.json({ items });
 }));
 
@@ -204,7 +204,7 @@ async function storeView(id: number, w: Where) {
   if (!s || !(await storeLive(pool, s))) throw notFound('Store');
   const d = w.lat != null && w.lng != null && s.lat != null ? distanceKm(w.lat, w.lng, Number(s.lat), Number(s.lng)) : null;
   const cats = await q<any>(pool, 'SELECT category, COUNT(*) n FROM store_products WHERE retailer_id = ? AND deleted_at IS NULL AND is_active = 1 AND category IS NOT NULL GROUP BY category ORDER BY category', [id]);
-  const offers = await q<any>(pool, `SELECT id, title, description FROM store_offers WHERE retailer_id = ? AND is_active = 1 AND (starts_on IS NULL OR starts_on <= CURDATE()) AND (ends_on IS NULL OR ends_on >= CURDATE()) ORDER BY id DESC LIMIT 10`, [id]);
+  const offers = await q<any>(pool, `SELECT id, title, description, IF(image_key IS NULL, NULL, CONCAT('/api/v1/media/', image_key)) image_url FROM store_offers WHERE retailer_id = ? AND is_active = 1 AND (starts_on IS NULL OR starts_on <= CURDATE()) AND (ends_on IS NULL OR ends_on >= CURDATE()) ORDER BY id DESC LIMIT 10`, [id]);
   return { store: presentStore(s, { distance: d }), categories: cats.map((c) => ({ name: c.category, products: Number(c.n) })), offers };
 }
 

@@ -471,3 +471,21 @@ describe('the customer bell', () => {
     expect((await request(app).get('/api/v1/store/customers').set(auth(r.token))).body.customers[0].name).toBe('Riya Mom');
   });
 });
+
+describe('offer banner pictures', () => {
+  it('lets a retailer upload a banner for an offer, which customers then see', async () => {
+    const a = await admin(); const d = await distributor(); const r = await liveRetailer(a, d);
+    const c = await customer({ store_code: (await store(r)).store_code });
+    const o = (await request(app).post('/api/v1/store/offers').set(auth(r.token)).send({ title: 'Friday offer' }).expect(201)).body;
+    expect(o.image_url).toBeNull();
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64');
+    const up = await request(app).post(`/api/v1/store/offers/${o.id}/image`).set(auth(r.token)).set('Content-Type', 'image/png').send(png).expect(201);
+    expect(up.body.image_url).toMatch(/^\/api\/v1\/media\/[a-f0-9]{40}$/);
+    await request(app).get(up.body.image_url).expect(200);
+    const home = (await request(app).get('/api/v1/customer/home').set(auth(c.token))).body;
+    expect(home.banners[0].image_url).toBe(up.body.image_url);
+    expect((await request(app).get('/api/v1/customer/notifications').set(auth(c.token))).body.items[0].image_url).toBe(up.body.image_url);
+    const other = await liveRetailer(a, d);
+    await request(app).post(`/api/v1/store/offers/${o.id}/image`).set(auth(other.token)).set('Content-Type', 'image/png').send(png).expect(404);
+  });
+});

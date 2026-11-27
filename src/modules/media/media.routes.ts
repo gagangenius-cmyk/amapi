@@ -9,7 +9,7 @@ export const mediaRouter = Router();
 mediaRouter.get('/:key', asyncHandler(async (req, res) => {
   const key = req.params.key;
   const valid = /^[a-f0-9]{40}$/.test(key);
-  const img = valid ? ((await q1<any>(pool, 'SELECT mime FROM product_images WHERE file_key = ?', [key])) ?? (await q1<any>(pool, 'SELECT photo_mime AS mime FROM field_logs WHERE photo_key = ?', [key])) ?? (await q1<any>(pool, 'SELECT mime FROM store_product_images WHERE file_key = ?', [key]))) : undefined;
+  const img = valid ? ((await q1<any>(pool, 'SELECT mime FROM product_images WHERE file_key = ?', [key])) ?? (await q1<any>(pool, 'SELECT photo_mime AS mime FROM field_logs WHERE photo_key = ?', [key])) ?? (await q1<any>(pool, 'SELECT mime FROM store_product_images WHERE file_key = ?', [key])) ?? (await q1<any>(pool, 'SELECT image_mime AS mime FROM store_offers WHERE image_key = ?', [key]))) : undefined;
   if (!img) return void res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Photo not found' } });
   res.setHeader('Content-Type', img.mime);
   res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
